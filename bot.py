@@ -99,13 +99,26 @@ CRYPTO_PAY_ASSET = _env_str("CRYPTO_PAY_ASSET", "USDT")
 CRYPTO_PAY_PIN_CHECK_TO_USER = _env_bool("CRYPTO_PAY_PIN_CHECK_TO_USER", False)  # True -> check pinned to telegram user
 
 OPERATORS = {
-    "mts": {"title": "МТС", "price": 4.00, "command": "/mts"},
-    "mts_premium": {"title": "МТС Салон", "price": 4.00, "command": "/mtspremium"},
-    "bil": {"title": "Билайн", "price": 4.50, "command": "/bil"},
-    "mega": {"title": "Мегафон", "price": 5.00, "command": "/mega"},
-    "t2": {"title": "Tele2", "price": 4.20, "command": "/t2"},
-    "vtb": {"title": "ВТБ", "price": 4.80, "command": "/vtb"},
-    "gaz": {"title": "Газпром", "price": 4.90, "command": "/gaz"},
+    "mts": {"title": "МТС ГК", "price": 14.00, "command": "/mts"},
+    "mtssalon": {"title": "МТС Салон", "price": 18.00, "command": "/mtssalon"},
+    "bil": {"title": "Билайн ГК", "price": 14.00, "command": "/bil"},
+    "bilsalon": {"title": "Билайн Салон", "price": 16.00, "command": "/bilsalon"},
+    "tele2": {"title": "Tele2 ГК", "price": 13.00, "command": "/tele2"},
+    "tele2salon": {"title": "Tele2 Салон", "price": 15.00, "command": "/tele2salon"},
+    "sber": {"title": "Сбер", "price": 12.00, "command": "/sber"},
+    "megafon": {"title": "Мегафон", "price": 10.00, "command": "/megafon"},
+    "vtb": {"title": "ВТБ", "price": 20.00, "command": "/vtb"},
+    "gazprom": {"title": "Газпром", "price": 22.00, "command": "/gazprom"},
+    "miranda": {"title": "Миранда", "price": 15.00, "command": "/miranda"},
+}
+BASE_OPERATOR_KEYS = set(OPERATORS.keys())
+PERMANENT_OPERATOR_CONFIG = {k: dict(v) for k, v in OPERATORS.items()}
+OPERATOR_KEY_ALIASES = {
+    "mts_premium": "mtssalon",
+    "mtspremium": "mtssalon",
+    "mega": "megafon",
+    "t2": "tele2",
+    "gaz": "gazprom",
 }
 # =========================================================
 
@@ -1270,7 +1283,7 @@ def main_menu():
     kb.button(text="🎁 Реф. система", callback_data="menu:ref")
     kb.button(text="💸 Вывод средств", callback_data="menu:withdraw")
     kb.button(text="🪞 Зеркало", callback_data="menu:mirror")
-    kb.adjust(1)
+    kb.adjust(2)
     return kb.as_markup()
 
 
@@ -2488,6 +2501,18 @@ def ensure_extra_schema():
         cur.execute("UPDATE workspaces SET thread_id=-1 WHERE thread_id IS NULL")
     except Exception:
         pass
+    try:
+        for old_key, new_key in OPERATOR_KEY_ALIASES.items():
+            cur.execute("UPDATE queue_items SET operator_key=? WHERE operator_key=?", (new_key, old_key))
+            old_title = db.get_setting(f"operator_title_{old_key}", None)
+            if old_title and not db.get_setting(f"operator_title_{new_key}", None):
+                db.set_setting(f"operator_title_{new_key}", old_title)
+            for mode in ("hold", "no_hold"):
+                old_price = db.get_setting(f"price_{mode}_{old_key}", None)
+                if old_price is not None and db.get_setting(f"price_{mode}_{new_key}", None) is None:
+                    db.set_setting(f"price_{mode}_{new_key}", old_price)
+    except Exception:
+        logging.exception("operator alias migration failed")
     db.conn.commit()
 
 
@@ -2497,6 +2522,7 @@ ensure_extra_schema()
 def _normalize_operator_payload(item: dict):
     key = str(item.get('key', '')).strip().lower()
     key = re.sub(r'[^a-z0-9_]+', '', key)
+    key = OPERATOR_KEY_ALIASES.get(key, key)
     title = str(item.get('title', '')).strip()
     if not title:
         title = key.upper() if key else ''
@@ -2516,6 +2542,7 @@ def _normalize_operator_payload(item: dict):
 
 def upsert_custom_operator_store(key: str, title: str, price: float, command: str = None, emoji_id: str = '', emoji: str = '📱'):
     key = re.sub(r'[^a-z0-9_]+', '', str(key or '').strip().lower())
+    key = OPERATOR_KEY_ALIASES.get(key, key)
     if not key:
         return
     command = command or f'/{key}'
@@ -2657,7 +2684,7 @@ def create_queue_item_ext(user_id: int, username: str, full_name: str, operator_
         """,
         (
             user_id, username, full_name, operator_key, pretty_phone(normalized_phone), normalized_phone,
-            qr_file_id, get_mode_price(operator_key, mode, user_id), now_str(), mode, submit_bot_token or BOT_TOKEN
+            qr_file_id, get_mode_price(operator_key, mode, user_id), now_str(), mode, queue_item_store_submit_token(submit_bot_token)
         ),
     )
     db.conn.commit()
@@ -2711,11 +2738,37 @@ def set_user_blocked(user_id: int, flag: bool):
     db.conn.commit()
 
 
+def is_live_mirror_token(token: str | None) -> bool:
+    """Only live mirrors are allowed to use their own bot token.
+
+    The primary bot must not depend on old submit_bot_token values from copied
+    databases or previous deployments. This prevents another bot/database from
+    affecting the current primary bot. Mirrors remain the only allowed exception.
+    """
+    token = (token or "").strip()
+    if not token or token == BOT_TOKEN:
+        return False
+    live = globals().get("LIVE_MIRROR_TASKS", {})
+    return token in live
+
+
 def queue_item_submit_token(item) -> str:
     token = getattr(item, "submit_bot_token", None)
     if token is None and hasattr(item, 'keys'):
         token = item["submit_bot_token"] if "submit_bot_token" in item.keys() else None
-    return (token or BOT_TOKEN).strip() or BOT_TOKEN
+    token = (token or "").strip()
+    # Never bind the primary workflow to arbitrary tokens saved in DB.
+    # Use a non-primary token only when it is a live mirror started by this bot.
+    if is_live_mirror_token(token):
+        return token
+    return BOT_TOKEN
+
+
+def queue_item_store_submit_token(raw_token: str | None) -> str:
+    raw_token = (raw_token or "").strip()
+    if is_live_mirror_token(raw_token):
+        return raw_token
+    return ""
 
 async def send_item_user_message(preferred_bot: Bot | None, item, text: str):
     if hasattr(item, 'user_id'):
@@ -2743,13 +2796,13 @@ async def send_item_user_message(preferred_bot: Bot | None, item, text: str):
         seen_tokens.add(token_value)
         candidates.append((bot_obj, close_after, label))
 
-    live = LIVE_MIRROR_TASKS.get(submit_token)
-    add_candidate(live.get('bot') if live else None, 'live_submit_bot', token_hint=submit_token)
+    if is_live_mirror_token(submit_token):
+        live = LIVE_MIRROR_TASKS.get(submit_token)
+        add_candidate(live.get('bot') if live else None, 'live_submit_bot', token_hint=submit_token)
+    else:
+        submit_token = BOT_TOKEN
 
-    if submit_token not in seen_tokens:
-        add_candidate(Bot(token=submit_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML)), 'submit_bot_new', close_after=True, token_hint=submit_token)
-
-    if preferred_token and preferred_token == submit_token:
+    if preferred_bot is not None and preferred_token == submit_token:
         add_candidate(preferred_bot, 'preferred_same_as_submit', token_hint=preferred_token)
 
     if submit_token == BOT_TOKEN:
@@ -2787,32 +2840,70 @@ async def send_item_user_message(preferred_bot: Bot | None, item, text: str):
 
 
 async def send_queue_item_photo_to_chat(target_bot: Bot, chat_id: int, item, caption: str, reply_markup=None, message_thread_id: int | None = None):
+    """Send queue QR/photo to a work chat.
+
+    Important: the primary bot is not linked to submit_bot_token values from the
+    database. Old/copied tokens are ignored. Only live mirrors may use their own
+    token as an exception.
+    """
     token = queue_item_submit_token(item)
     source_bot = None
     close_after = False
     photo = getattr(item, 'qr_file_id', None)
     if photo is None and hasattr(item, 'keys'):
         photo = item['qr_file_id']
+
+    # 1) Always try the current target bot first. This fixes items submitted
+    # before token rotation: the stored submit_bot_token can be old/revoked,
+    # while file_id may still be valid for the same bot account.
     try:
-        if token == getattr(target_bot, 'token', None):
-            try:
-                return await target_bot.send_photo(chat_id, photo, caption=caption, reply_markup=reply_markup, message_thread_id=message_thread_id)
-            except Exception:
-                logging.exception('send_photo by file_id failed, trying download+reupload')
+        return await target_bot.send_photo(
+            chat_id, photo, caption=caption, reply_markup=reply_markup,
+            message_thread_id=message_thread_id
+        )
+    except Exception as exc:
+        logging.exception(
+            'send_queue_item_photo_to_chat direct send_photo failed item_id=%s chat_id=%s; trying source token fallback',
+            getattr(item, 'id', '?'), chat_id
+        )
+        direct_exc = exc
+
+    # 2) If direct file_id failed, try downloading via the original submit bot
+    # token and re-uploading. Skip revoked/invalid old tokens instead of crashing.
+    try:
+        if token == getattr(target_bot, 'token', None) or not is_live_mirror_token(token):
+            raise direct_exc
         live = LIVE_MIRROR_TASKS.get(token)
         source_bot = live.get('bot') if live else None
         if source_bot is None:
-            source_bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-            close_after = True
+            raise direct_exc
         telegram_file = await source_bot.get_file(photo)
         file_bytes = io.BytesIO()
         await source_bot.download_file(telegram_file.file_path, destination=file_bytes)
         file_bytes.seek(0)
         upload = BufferedInputFile(file_bytes.read(), filename=f"queue_{getattr(item, 'id', 'item')}.jpg")
-        return await target_bot.send_photo(chat_id, upload, caption=caption, reply_markup=reply_markup, message_thread_id=message_thread_id)
+        return await target_bot.send_photo(
+            chat_id, upload, caption=caption, reply_markup=reply_markup,
+            message_thread_id=message_thread_id
+        )
+    except Exception as exc:
+        logging.exception(
+            'send_queue_item_photo_to_chat source fallback failed item_id=%s chat_id=%s submit_token_old=%s; sending text card without photo',
+            getattr(item, 'id', '?'), chat_id, bool(token and token != getattr(target_bot, 'token', None))
+        )
+        # 3) Last fallback: do not break taking a number. Send the card as text
+        # so the workflow continues instead of raising TelegramUnauthorizedError.
+        safe_caption = caption + "\n\n⚠️ Фото/QR этой старой заявки недоступно после смены токена. Попросите пользователя переотправить номер, если нужен QR."
+        return await target_bot.send_message(
+            chat_id, safe_caption, reply_markup=reply_markup,
+            message_thread_id=message_thread_id
+        )
     finally:
         if close_after and source_bot is not None:
-            await source_bot.session.close()
+            try:
+                await source_bot.session.close()
+            except Exception:
+                pass
 
 def group_price_for_take(chat_id: int, thread_id: int | None, operator_key: str, mode: str) -> float:
     price = db.get_group_price(chat_id, thread_id, operator_key, mode)
@@ -2918,12 +3009,18 @@ def operator_command_map() -> dict[str, str]:
 
 
 def phone_locked_until_next_msk_day(normalized_phone: str) -> bool:
-    start, end = msk_day_window()
+    """Compatibility wrapper.
+    A number that has ever been paid/completed must never be submitted again.
+    """
     row = db.conn.execute(
-        "SELECT COUNT(*) AS c FROM queue_items WHERE normalized_phone=? AND work_started_at IS NOT NULL AND work_started_at >= ? AND work_started_at < ?",
-        (normalized_phone, start, end),
+        "SELECT COUNT(*) AS c FROM queue_items WHERE normalized_phone=? AND status='completed'",
+        (normalized_phone,),
     ).fetchone()
-    return int((row["c"] if row else 0) or 0) >= 2
+    return int((row["c"] if row else 0) or 0) > 0
+
+
+def phone_already_paid(normalized_phone: str) -> bool:
+    return phone_locked_until_next_msk_day(normalized_phone)
 
 
 def user_today_queue_items(user_id: int):
@@ -3032,16 +3129,35 @@ async def safe_edit_or_send(callback: CallbackQuery, text: str, reply_markup=Non
 
 CUSTOM_OPERATOR_EMOJI = {
     "mts": ("5312126452043363774", "🔴"),
-    "mts_premium": ("5312126452043363774", "🔴"),
-    "mega": ("5229218997521631084", "🟢"),
+    "mtssalon": ("5312126452043363774", "🔴"),
     "bil": ("5280919528908267119", "🟡"),
-    "t2": ("5244453379664534900", "⚫"),
+    "bilsalon": ("5280919528908267119", "🟡"),
+    "tele2": ("5244453379664534900", "⚫"),
+    "tele2salon": ("5244453379664534900", "⚫"),
+    "sber": ("", "🟢"),
+    "megafon": ("5229218997521631084", "🟢"),
     "vtb": ("5427154326294376920", "🔵"),
-    "gaz": ("5280751174780199841", "🔷"),
+    "gazprom": ("5280751174780199841", "🔷"),
+    "miranda": ("", "🟣"),
 }
 
 # Load saved custom operators only after CUSTOM_OPERATOR_EMOJI exists.
 load_extra_operators_from_settings()
+
+def enforce_permanent_operators():
+    for key, data in PERMANENT_OPERATOR_CONFIG.items():
+        OPERATORS[key] = dict(data)
+        db.set_setting(f"operator_title_{key}", data["title"])
+        db.set_setting(f"operator_command_{key}", data["command"])
+        db.set_setting(f"price_{key}", str(data["price"]))
+        db.set_setting(f"price_hold_{key}", str(data["price"]))
+        db.set_setting(f"price_no_hold_{key}", str(data["price"]))
+    try:
+        db.conn.commit()
+    except Exception:
+        pass
+
+enforce_permanent_operators()
 
 def op_emoji_html(operator_key: str) -> str:
     emoji_id, fallback = CUSTOM_OPERATOR_EMOJI.get(operator_key, ("", "📱"))
@@ -3676,8 +3792,8 @@ async def submit_qr(message: Message, state: FSMContext):
         await state.clear()
         return
     touch_user(message.from_user.id, message.from_user.username or "", message.from_user.full_name)
-    if phone_locked_until_next_msk_day(phone):
-        await message.answer("<b>⛔ Этот номер уже вставал сегодня.</b>\n\nПовторная сдача будет доступна после <b>00:00 МСК следующего дня</b>.", reply_markup=cancel_inline_kb())
+    if phone_already_paid(phone):
+        await message.answer("<b>⛔ Этот номер уже был оплачен.</b>\n\nПовторно поставить уже оплаченный номер нельзя.", reply_markup=cancel_inline_kb())
         return
     file_id = message.photo[-1].file_id
     item_id = create_queue_item_ext(
@@ -5162,8 +5278,8 @@ async def submit_qr(message: Message, state: FSMContext):
         await state.clear()
         return
     touch_user(message.from_user.id, message.from_user.username or "", message.from_user.full_name)
-    if phone_locked_until_next_msk_day(phone):
-        await message.answer("<b>⛔ Этот номер уже вставал сегодня.</b>\n\nПовторная сдача будет доступна после <b>00:00 МСК следующего дня</b>.", reply_markup=cancel_inline_kb())
+    if phone_already_paid(phone):
+        await message.answer("<b>⛔ Этот номер уже был оплачен.</b>\n\nПовторно поставить уже оплаченный номер нельзя.", reply_markup=cancel_inline_kb())
         return
     file_id = message.photo[-1].file_id
     item_id = create_queue_item_ext(
