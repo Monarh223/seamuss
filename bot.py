@@ -1898,20 +1898,21 @@ def render_start(user_id: int) -> str:
     # Жёсткая страховка: caption должен остаться одним сообщением с фото.
     # Если в БД внезапно длинные названия операторов — убираем лишние жирные теги,
     # но не отправляем вторую плашку.
-    if len(_strip_html_tags(text)) > 980 or len(text) > 1024:
+    if _html_visible_len(text) > 1000:
         price_rows = []
         for key in OPERATORS.keys():
             if key not in PERMANENT_OPERATOR_KEYS:
                 continue
             data = OPERATORS.get(key, {})
-            emoji = (CUSTOM_OPERATOR_EMOJI.get(key, ("", "📞"))[1] or "📞").strip()
-            title_op = _strip_html_tags(str(data.get("title", key)))
+            # ВАЖНО: даже в компактном режиме оставляем premium emoji через <tg-emoji>.
+            emoji = op_emoji_html(key)
+            title_op = escape(_strip_html_tags(str(data.get("title", key))))
             hp = money_short(get_mode_price(key, "hold", user_id))
             np = money_short(get_mode_price(key, "no_hold", user_id))
             qh = count_waiting_mode(key, "hold")
             qn = count_waiting_mode(key, "no_hold")
-            price_rows.append(f"{emoji} {title_op} — {hp}/{np} · {qh}/{qn}")
-        prices_block_plain = "\n".join(price_rows)
+            price_rows.append(f"{emoji} <b>{title_op}</b> — {hp}/{np} · <i>{qh}/{qn}</i>")
+        prices_block_compact = "\n".join(price_rows)
         text = (
             f"💫 <b>{title}</b> 💫\n"
             f"{subtitle}\n\n"
@@ -1920,7 +1921,7 @@ def render_start(user_id: int) -> str:
             f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
             f"💰 <b>Баланс:</b> <b>{balance}</b>\n\n"
             f"💎 <b>Прайсы и очереди</b> <i>Х/БХ</i>\n"
-            f"<blockquote>{escape(prices_block_plain)}</blockquote>\n\n"
+            f"<blockquote>{prices_block_compact}</blockquote>\n\n"
             f"<b>Вы находитесь в главном меню.</b>\n"
             f"👇 <b>Выберите нужное действие ниже:</b>"
         )
@@ -3521,6 +3522,18 @@ def _html_balance_patch(text: str) -> str:
     return text
 
 
+def _html_visible_len(text: str) -> int:
+    """Telegram caption limit counts visible text after HTML entities are parsed.
+
+    Premium emoji tags make raw HTML long, but visible caption remains short.
+    """
+    try:
+        return len(_strip_html_tags(text or ""))
+    except Exception:
+        return len(text or "")
+
+
+
 def _strip_html_tags(text: str) -> str:
     import re
     return re.sub(r"<[^>]+>", "", text or "")
@@ -3544,7 +3557,7 @@ async def send_banner_message(entity, banner_path: str, caption: str, reply_mark
     if Path(banner_path).exists():
         # HTML нельзя резать посередине: Telegram ломает <blockquote>.
         # Большой текст отправляем отдельно от баннера, полностью сохраняя HTML.
-        if len(caption) <= 1024:
+        if _html_visible_len(caption) <= 1024:
             try:
                 if hasattr(entity, 'answer_photo'):
                     return await entity.answer_photo(FSInputFile(banner_path), caption=caption, reply_markup=reply_markup)
