@@ -3185,23 +3185,77 @@ CUSTOM_OPERATOR_EMOJI = {
     "miranda": ("", "🟣"),
 }
 
-# Load saved custom operators only after CUSTOM_OPERATOR_EMOJI exists.
-load_extra_operators_from_settings()
+# Load operators after CUSTOM_OPERATOR_EMOJI exists.
+# ВАЖНО: база данных является источником сохранённых операторов/цен.
 
 def enforce_permanent_operators():
+    """Keep built-in operators available without wiping DB-saved values."""
     for key, data in PERMANENT_OPERATOR_CONFIG.items():
-        OPERATORS[key] = dict(data)
-        db.set_setting(f"operator_title_{key}", data["title"])
-        db.set_setting(f"operator_command_{key}", data["command"])
-        db.set_setting(f"price_{key}", str(data["price"]))
-        db.set_setting(f"price_hold_{key}", str(data["price"]))
-        db.set_setting(f"price_no_hold_{key}", str(data["price"]))
+        title = db.get_setting(f"operator_title_{key}", data["title"]) or data["title"]
+        command = db.get_setting(f"operator_command_{key}", data["command"]) or data["command"]
+        price_raw = db.get_setting(f"price_{key}", None)
+        if price_raw is None:
+            price_raw = db.get_setting(f"price_hold_{key}", str(data["price"]))
+        try:
+            price = float(price_raw or data["price"])
+        except Exception:
+            price = float(data["price"])
+        OPERATORS[key] = {"title": title, "price": price, "command": command}
+        if db.get_setting(f"operator_title_{key}", None) is None:
+            db.set_setting(f"operator_title_{key}", title)
+        if db.get_setting(f"operator_command_{key}", None) is None:
+            db.set_setting(f"operator_command_{key}", command)
+        if db.get_setting(f"price_{key}", None) is None:
+            db.set_setting(f"price_{key}", str(price))
+        if db.get_setting(f"price_hold_{key}", None) is None:
+            db.set_setting(f"price_hold_{key}", str(price))
+        if db.get_setting(f"price_no_hold_{key}", None) is None:
+            db.set_setting(f"price_no_hold_{key}", str(price))
     try:
         db.conn.commit()
     except Exception:
         pass
 
-enforce_permanent_operators()
+
+def restore_operators_from_db_anywhere():
+    """Load every saved operator from DB settings/history/custom table."""
+    enforce_permanent_operators()
+    load_extra_operators_from_settings()
+    try:
+        rows = db.conn.execute("SELECT key, value FROM settings WHERE key LIKE 'operator_title_%' OR key LIKE 'price_%'").fetchall()
+        keys = set()
+        for r in rows:
+            name = str(r['key'])
+            if name.startswith('operator_title_'):
+                keys.add(name[len('operator_title_'):])
+            elif name.startswith('price_hold_'):
+                keys.add(name[len('price_hold_'):])
+            elif name.startswith('price_no_hold_'):
+                keys.add(name[len('price_no_hold_'):])
+            elif name.startswith('price_'):
+                k2 = name[len('price_'): ]
+                if k2 not in ('hold', 'no_hold'):
+                    keys.add(k2)
+        for raw_key in sorted(keys):
+            key = OPERATOR_KEY_ALIASES.get(str(raw_key).strip().lower(), str(raw_key).strip().lower())
+            if not key or key in OPERATORS:
+                continue
+            title = db.get_setting(f'operator_title_{key}', key.upper())
+            command = db.get_setting(f'operator_command_{key}', f'/{key}')
+            raw_price = db.get_setting(f'price_{key}', db.get_setting(f'price_hold_{key}', db.get_setting(f'price_no_hold_{key}', '0')))
+            try:
+                price = float(raw_price or 0)
+            except Exception:
+                price = 0.0
+            emoji_id = db.get_setting(f'operator_emoji_id_{key}', '')
+            emoji = db.get_setting(f'operator_emoji_{key}', '📱')
+            upsert_custom_operator_store(key, title, price, command, emoji_id, emoji)
+            logging.warning('Restored operator from settings: key=%s title=%s price=%s', key, title, price)
+    except Exception:
+        logging.exception('restore operators from settings failed')
+
+
+restore_operators_from_db_anywhere()
 
 def op_emoji_html(operator_key: str) -> str:
     emoji_id, fallback = CUSTOM_OPERATOR_EMOJI.get(operator_key, ("", "📱"))
