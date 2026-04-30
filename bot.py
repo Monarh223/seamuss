@@ -3966,10 +3966,15 @@ async def takeop_callback(callback: CallbackQuery):
             return
         item = db.get_queue_item(item['id'])
     caption = queue_caption(item) + "\n\n👇 Выберите действие:"
-    if getattr(callback.message, 'photo', None):
-        await callback.message.answer_photo(item['qr_file_id'], caption=caption, reply_markup=admin_queue_kb(item))
-    else:
-        await callback.message.answer_photo(item['qr_file_id'], caption=caption, reply_markup=admin_queue_kb(item))
+    thread_id = getattr(callback.message, 'message_thread_id', None)
+    await send_queue_item_photo_to_chat(
+        callback.bot,
+        callback.message.chat.id,
+        item,
+        caption,
+        reply_markup=admin_queue_kb(item),
+        message_thread_id=thread_id,
+    )
     await safe_callback_answer(callback)
 
 
@@ -5456,10 +5461,15 @@ async def takeop_callback(callback: CallbackQuery):
             return
         item = db.get_queue_item(item['id'])
     caption = queue_caption(item) + "\n\n👇 Выберите действие:"
-    if getattr(callback.message, 'photo', None):
-        await callback.message.answer_photo(item['qr_file_id'], caption=caption, reply_markup=admin_queue_kb(item))
-    else:
-        await callback.message.answer_photo(item['qr_file_id'], caption=caption, reply_markup=admin_queue_kb(item))
+    thread_id = getattr(callback.message, 'message_thread_id', None)
+    await send_queue_item_photo_to_chat(
+        callback.bot,
+        callback.message.chat.id,
+        item,
+        caption,
+        reply_markup=admin_queue_kb(item),
+        message_thread_id=thread_id,
+    )
     await safe_callback_answer(callback)
 
 
