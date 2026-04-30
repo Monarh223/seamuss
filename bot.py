@@ -3421,14 +3421,47 @@ def make_operator_button(operator_key: str, *, callback_data: str, prefix_mark: 
     return InlineKeyboardButton(**payload)
 
 
+async def safe_callback_answer(callback: CallbackQuery, text: str | None = None, show_alert: bool = False):
+    """Answer callback without crashing on old/expired query ids."""
+    try:
+        if text is None:
+            return await callback.answer()
+        return await callback.answer(text, show_alert=show_alert)
+    except TelegramBadRequest as e:
+        err = str(e)
+        if "query is too old" in err or "query ID is invalid" in err or "response timeout expired" in err:
+            logging.warning("callback.answer ignored: expired callback user_id=%s data=%s", getattr(callback.from_user, 'id', None), getattr(callback, 'data', None))
+            return None
+        raise
+
+
+def _split_caption_for_photo(caption: str) -> tuple[str, str]:
+    """Telegram photo caption limit is 1024 chars. Keep photo safe and send rest separately."""
+    caption = caption or ""
+    if len(caption) <= 1000:
+        return caption, ""
+    cut = caption.rfind("\n", 0, 980)
+    if cut < 300:
+        cut = 980
+    first = caption[:cut].rstrip()
+    rest = caption[cut:].lstrip()
+    return first, rest
+
+
 async def send_banner_message(entity, banner_path: str, caption: str, reply_markup=None):
+    target = entity if isinstance(entity, Message) else entity.message
     if Path(banner_path).exists():
+        photo_caption, rest_text = _split_caption_for_photo(caption)
         if hasattr(entity, 'answer_photo'):
-            return await entity.answer_photo(FSInputFile(banner_path), caption=caption, reply_markup=reply_markup)
-        return await entity.message.answer_photo(FSInputFile(banner_path), caption=caption, reply_markup=reply_markup)
-    if hasattr(entity, 'answer'):
-        return await entity.answer(caption, reply_markup=reply_markup)
-    return await entity.message.answer(caption, reply_markup=reply_markup)
+            sent = await entity.answer_photo(FSInputFile(banner_path), caption=photo_caption, reply_markup=(reply_markup if not rest_text else None))
+            if rest_text:
+                await entity.answer(rest_text, reply_markup=reply_markup)
+            return sent
+        sent = await entity.message.answer_photo(FSInputFile(banner_path), caption=photo_caption, reply_markup=(reply_markup if not rest_text else None))
+        if rest_text:
+            await entity.message.answer(rest_text, reply_markup=reply_markup)
+        return sent
+    return await target.answer(caption, reply_markup=reply_markup)
 
 
 async def replace_banner_message(callback: CallbackQuery, banner_path: str, caption: str, reply_markup=None):
@@ -3659,7 +3692,7 @@ async def noop(callback: CallbackQuery):
             return
     except Exception as e:
         logging.warning("noop close edit markup failed: %s", e)
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data == "join:check")
 async def join_check(callback: CallbackQuery, state: FSMContext):
@@ -3676,13 +3709,13 @@ async def menu_home(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     if not await is_user_joined_required_group(callback.bot, callback.from_user.id):
         await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), '<b>🔒 Доступ ограничен</b>\n\nДля использования бота нужна обязательная подписка на группу.\n\nПосле вступления нажмите <b>«Проверить подписку»</b>.', required_join_kb().as_markup())
-        await callback.answer()
+        await safe_callback_answer(callback)
         return
     if is_user_blocked(callback.from_user.id):
         await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), blocked_text(), None)
     else:
         await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), render_start(callback.from_user.id), main_menu())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "menu:mirror")
@@ -3694,7 +3727,7 @@ async def mirror_menu(callback: CallbackQuery, state: FSMContext):
         render_mirror_menu(callback.from_user.id),
         mirror_menu_kb(),
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data == "mirror:list")
 async def mirror_list(callback: CallbackQuery, state: FSMContext):
@@ -3705,7 +3738,7 @@ async def mirror_list(callback: CallbackQuery, state: FSMContext):
         render_mirror_menu(callback.from_user.id),
         mirror_menu_kb(),
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data == "mirror:create")
 async def mirror_create(callback: CallbackQuery, state: FSMContext):
@@ -3721,7 +3754,7 @@ async def mirror_create(callback: CallbackQuery, state: FSMContext):
         "Этот бот будет сохранён как зеркало сервиса без выдачи дополнительных прав.",
         kb.as_markup(),
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.message(MirrorStates.waiting_token)
 async def mirror_token_received(message: Message, state: FSMContext):
@@ -3762,11 +3795,11 @@ async def menu_my(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     if not await is_user_joined_required_group(callback.bot, callback.from_user.id):
         await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), '<b>🔒 Доступ ограничен</b>\n\nДля использования бота нужна обязательная подписка на группу.\n\nПосле вступления нажмите <b>«Проверить подписку»</b>.', required_join_kb().as_markup())
-        await callback.answer()
+        await safe_callback_answer(callback)
         return
     items = user_active_queue_items(callback.from_user.id)
     await replace_banner_message(callback, db.get_setting('my_numbers_banner_path', MY_NUMBERS_BANNER), render_my_numbers(callback.from_user.id, 0), my_numbers_kb(items, 0))
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data.startswith("my:page:"))
 async def my_numbers_page(callback: CallbackQuery, state: FSMContext):
@@ -3777,14 +3810,14 @@ async def my_numbers_page(callback: CallbackQuery, state: FSMContext):
         page = 0
     items = user_active_queue_items(callback.from_user.id)
     await replace_banner_message(callback, db.get_setting('my_numbers_banner_path', MY_NUMBERS_BANNER), render_my_numbers(callback.from_user.id, page), my_numbers_kb(items, page))
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data == "menu:profile")
 async def menu_profile(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     if not await is_user_joined_required_group(callback.bot, callback.from_user.id):
         await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), '<b>🔒 Доступ ограничен</b>\n\nДля использования бота нужна обязательная подписка на группу.\n\nПосле вступления нажмите <b>«Проверить подписку»</b>.', required_join_kb().as_markup())
-        await callback.answer()
+        await safe_callback_answer(callback)
         return
     try:
         text = render_profile(callback.from_user.id)
@@ -3792,24 +3825,24 @@ async def menu_profile(callback: CallbackQuery, state: FSMContext):
         logging.exception("profile render failed user_id=%s", callback.from_user.id)
         text = "<b>👤 Профиль</b>\n\nПрофиль временно восстановлен. Попробуйте открыть ещё раз или напишите /start."
     await replace_banner_message(callback, db.get_setting('profile_banner_path', PROFILE_BANNER), text, profile_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data == "menu:ref")
 async def menu_ref(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     if not await is_user_joined_required_group(callback.bot, callback.from_user.id):
         await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), '<b>🔒 Доступ ограничен</b>\n\nДля использования бота нужна обязательная подписка на группу.\n\nПосле вступления нажмите <b>«Проверить подписку»</b>.', required_join_kb().as_markup())
-        await callback.answer()
+        await safe_callback_answer(callback)
         return
     await replace_banner_message(callback, db.get_setting('profile_banner_path', PROFILE_BANNER), render_referral(callback.from_user.id), referral_kb(callback.from_user.id))
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data == "menu:withdraw")
 async def menu_withdraw(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     if not await is_user_joined_required_group(callback.bot, callback.from_user.id):
         await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), '<b>🔒 Доступ ограничен</b>\n\nДля использования бота нужна обязательная подписка на группу.\n\nПосле вступления нажмите <b>«Проверить подписку»</b>.', required_join_kb().as_markup())
-        await callback.answer()
+        await safe_callback_answer(callback)
         return
     payout_link = db.get_payout_link(callback.from_user.id)
     if not payout_link:
@@ -3821,7 +3854,7 @@ async def menu_withdraw(callback: CallbackQuery, state: FSMContext):
     else:
         await state.set_state(WithdrawStates.waiting_amount)
         await replace_banner_message(callback, db.get_setting('withdraw_banner_path', WITHDRAW_BANNER), render_withdraw(callback.from_user.id), cancel_inline_kb("menu:profile"))
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data == "menu:payout_link")
 async def payout_link_cb(callback: CallbackQuery, state: FSMContext):
@@ -3835,7 +3868,7 @@ async def payout_link_cb(callback: CallbackQuery, state: FSMContext):
         render_withdraw_setup(),
         kb.as_markup(),
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data.startswith("submit_more:"))
 async def submit_more(callback: CallbackQuery, state: FSMContext):
@@ -3912,14 +3945,14 @@ async def takeop_callback(callback: CallbackQuery):
         await callback.message.answer_photo(item['qr_file_id'], caption=caption, reply_markup=admin_queue_kb(item))
     else:
         await callback.message.answer_photo(item['qr_file_id'], caption=caption, reply_markup=admin_queue_kb(item))
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "menu:submit")
 async def submit_start_cb(callback: CallbackQuery, state: FSMContext):
     if not await is_user_joined_required_group(callback.bot, callback.from_user.id):
         await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), '<b>🔒 Доступ ограничен</b>\n\nДля использования бота нужна обязательная подписка на группу.\n\nПосле вступления нажмите <b>«Проверить подписку»</b>.', required_join_kb().as_markup())
-        await callback.answer()
+        await safe_callback_answer(callback)
         return
     if is_user_blocked(callback.from_user.id):
         await callback.answer("Аккаунт заблокирован", show_alert=True)
@@ -3929,7 +3962,7 @@ async def submit_start_cb(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(SubmitStates.waiting_mode)
     await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), "<b>💫 ESIM Service X 💫</b>\n\n<b>📲 Сдать номер - ЕСИМ</b>\n\nСначала выберите режим работы для новой заявки:", mode_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "mode:back")
@@ -3939,13 +3972,13 @@ async def mode_back(callback: CallbackQuery, state: FSMContext):
         await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), blocked_text(), None)
     else:
         await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), render_start(callback.from_user.id), main_menu())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data.startswith("mode:"))
 async def choose_mode(callback: CallbackQuery, state: FSMContext):
     mode = callback.data.split(":", 1)[1]
     if mode not in {"hold", "no_hold"}:
-        await callback.answer()
+        await safe_callback_answer(callback)
         return
     await state.update_data(mode=mode)
     await state.set_state(SubmitStates.waiting_operator)
@@ -3962,14 +3995,14 @@ async def choose_mode(callback: CallbackQuery, state: FSMContext):
         f"<b>Режим выбран: {mode_title}</b>\n\n{mode_desc}\n\n👇 <b>Теперь выберите оператора:</b>",
         operators_kb(mode, "op", "op:back", callback.from_user.id),
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "op:back")
 async def op_back(callback: CallbackQuery, state: FSMContext):
     await state.set_state(SubmitStates.waiting_mode)
     await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), "<b>💫 ESIM Service X 💫</b>\n\n<b>📲 Сдать номер - ЕСИМ</b>\n\nСначала выберите режим работы для новой заявки:", mode_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data.startswith("op:"))
@@ -3991,7 +4024,7 @@ async def choose_operator(callback: CallbackQuery, state: FSMContext):
         "<b>💫 ESIM Service X 💫</b>\n\n<b>📨 Отправьте QR-код - Фото сообщением</b>\n\n👉 <b>Требуется:</b>\n▫️ Фото QR\n▫️ В подписи укажите номер\n\n🔰 <b>Допустимый формат номера:</b>\n<blockquote>+79991234567  «+7»\n79991234567   «7»\n89991234567   «8»</blockquote>\n\nЕсли передумали нажмите ниже - Отмена",
         cancel_inline_kb("op:back"),
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.message(WithdrawStates.waiting_amount, F.text == "↩️ Назад")
@@ -4141,7 +4174,7 @@ async def withdraw_cancel(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text("❌ Вывод отменён.")
     await send_banner_message(callback.message, db.get_setting('profile_banner_path', PROFILE_BANNER), render_profile(callback.from_user.id), profile_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data.startswith("withdraw_confirm:"))
@@ -4213,7 +4246,7 @@ async def withdraw_confirm(callback: CallbackQuery):
         "✅ Заявка на вывод создана. Она отправлена в канал выплат." if sent_ok else "⚠️ Заявка создана, но сообщение в канал выплат не отправилось. Проверь логи и настройки канала."
     )
     await send_banner_message(callback.message, db.get_setting('withdraw_banner_path', WITHDRAW_BANNER), render_withdraw(callback.from_user.id), cancel_inline_kb("menu:profile"))
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 
@@ -4317,7 +4350,7 @@ async def admin_home(callback: CallbackQuery, state: FSMContext):
         return
     await state.clear()
     await callback.message.edit_text(render_admin_home(), reply_markup=admin_root_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:summary")
@@ -4325,7 +4358,7 @@ async def admin_summary(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await callback.message.edit_text(render_admin_summary(), reply_markup=admin_summary_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:summary_by_date")
@@ -4334,7 +4367,7 @@ async def admin_summary_by_date(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminStates.waiting_summary_date)
     await callback.message.answer("📅 Введите дату в формате <code>ДД-ММ-ГГГГ</code> или <code>ДД.ММ.ГГГГ</code>.")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:treasury")
@@ -4342,7 +4375,7 @@ async def admin_treasury(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await callback.message.edit_text(render_admin_treasury(), reply_markup=treasury_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 
@@ -4363,14 +4396,14 @@ async def admin_treasury_check(callback: CallbackQuery):
         render_admin_treasury() + (f"\n\n✅ Подтверждено пополнений: <b>{usd(added)}</b>" if added else "\n\nПлатежей пока не найдено."),
         reply_markup=treasury_kb()
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data == "admin:withdraws")
 async def admin_withdraws(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await callback.message.edit_text(render_admin_withdraws(), reply_markup=admin_back_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:hold")
@@ -4378,7 +4411,7 @@ async def admin_hold(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await safe_edit_or_send(callback, render_admin_hold(), reply_markup=hold_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:prices")
@@ -4386,7 +4419,7 @@ async def admin_prices(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await safe_edit_or_send(callback, render_admin_prices(), reply_markup=prices_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:roles")
@@ -4394,7 +4427,7 @@ async def admin_roles(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await callback.message.edit_text(render_roles(), reply_markup=roles_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:workspaces")
@@ -4402,7 +4435,7 @@ async def admin_workspaces(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await callback.message.edit_text(render_workspaces(), reply_markup=workspaces_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:group_stats_panel")
@@ -4410,7 +4443,7 @@ async def admin_group_stats_panel(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await safe_edit_or_send(callback, "<b>📈 Выберите группу / топик для статистики:</b>", reply_markup=group_stats_list_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data.startswith("admin:groupstat:"))
 async def admin_groupstat_open(callback: CallbackQuery):
@@ -4421,7 +4454,7 @@ async def admin_groupstat_open(callback: CallbackQuery):
     thread = int(thread_id)
     thread = None if thread == 0 else thread
     await safe_edit_or_send(callback, render_single_group_stats(chat_id, thread), reply_markup=single_group_stats_kb(chat_id, thread))
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data.startswith("admin:group_remove:"))
 async def admin_group_remove_start(callback: CallbackQuery, state: FSMContext):
@@ -4452,7 +4485,7 @@ async def admin_settings(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await safe_edit_or_send(callback, render_admin_settings(), reply_markup=settings_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 
@@ -4461,7 +4494,7 @@ async def admin_operator_modes(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await safe_edit_or_send(callback, render_operator_modes(), reply_markup=operator_modes_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data.startswith("admin:toggle_avail:"))
 async def admin_toggle_avail(callback: CallbackQuery):
@@ -4478,7 +4511,7 @@ async def admin_design(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await callback.message.edit_text(render_design(), reply_markup=design_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:templates")
@@ -4486,7 +4519,7 @@ async def admin_templates(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await callback.message.edit_text(render_templates(), reply_markup=design_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:broadcast")
@@ -4494,7 +4527,7 @@ async def admin_broadcast(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await callback.message.edit_text(render_broadcast(), reply_markup=broadcast_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:broadcast_write")
@@ -4505,7 +4538,7 @@ async def admin_broadcast_write(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(
         "Отправьте текст рассылки одним сообщением.\n\nМожно использовать HTML Telegram: <code>&lt;b&gt;</code>, <code>&lt;i&gt;</code>, <code>&lt;blockquote&gt;</code>."
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:broadcast_preview")
@@ -4514,7 +4547,7 @@ async def admin_broadcast_preview(callback: CallbackQuery):
         return
     ad = db.get_setting("broadcast_text", "").strip()
     await callback.message.answer(ad or "Рассылка пока пустая.")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:broadcast_send_ad")
@@ -4533,7 +4566,7 @@ async def admin_broadcast_send_ad(callback: CallbackQuery):
         except Exception:
             pass
     await callback.message.answer(f"✅ Рассылка завершена. Доставлено: <b>{sent}</b>")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:usernames")
@@ -4543,7 +4576,7 @@ async def admin_usernames(callback: CallbackQuery):
     content = db.export_usernames().encode("utf-8")
     file = BufferedInputFile(content, filename="usernames.txt")
     await callback.message.answer_document(file, caption="📥 Собранные username и user_id")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:download_db")
@@ -4555,7 +4588,7 @@ async def admin_download_db(callback: CallbackQuery):
         await callback.answer("База не найдена", show_alert=True)
         return
     await callback.message.answer_document(FSInputFile(path), caption="<b>📦 SQLite база</b>")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data == "admin:upload_db")
 async def admin_upload_db(callback: CallbackQuery, state: FSMContext):
@@ -4563,7 +4596,7 @@ async def admin_upload_db(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminStates.waiting_db_upload)
     await callback.message.answer("<b>📥 Загрузка базы</b>\n\nПришлите файл <code>.db</code>, <code>.sqlite</code> или <code>.sqlite3</code>.")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:set_start_text")
@@ -4574,7 +4607,7 @@ async def admin_set_start_text(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(
         "Отправьте новый стартовый текст в формате:\n\n<code>Заголовок\nПодзаголовок\nОписание</code>\n\nПервые 2 строки пойдут в шапку, остальное в описание."
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:set_ad_text")
@@ -4585,7 +4618,7 @@ async def admin_set_ad_text(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(
         "Отправьте текст рассылки.\n\nМожно писать красивыми шаблонами и использовать HTML Telegram."
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:set_operator_emoji")
@@ -4598,7 +4631,7 @@ async def admin_set_operator_emoji_panel(callback: CallbackQuery, state: FSMCont
         "<b>💎 Эмодзи операторов</b>\n\nВыберите оператора. После этого отправьте <b>premium emoji</b>, <b>стикер</b> с ним, <b>ID</b> или <code>skip</code>, чтобы убрать premium emoji.",
         reply_markup=operator_emoji_pick_kb(),
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data.startswith("admin:pick_operator_emoji:"))
@@ -4625,7 +4658,7 @@ async def admin_pick_operator_emoji(callback: CallbackQuery, state: FSMContext):
         f"<b>💎 Эмодзи для оператора</b>\n\nОператор: <b>{escape(OPERATORS[key].get('title', key))}</b>\nТекущий emoji_id: <code>{escape(current_emoji_id or 'нет')}</code>\n\nОтправьте <b>premium emoji</b>, <b>стикер</b> с ним или просто <b>ID</b>.\nОтправьте <code>skip</code>, чтобы убрать premium emoji и оставить обычный смайл.",
         reply_markup=admin_back_kb("admin:set_operator_emoji"),
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:add_operator")
@@ -4640,7 +4673,7 @@ async def admin_add_operator(callback: CallbackQuery, state: FSMContext):
         "После этого бот отдельно попросит <b>premium emoji ID</b>.\n"
         "Команду указывать не нужно — она будет создана автоматически как <code>/key</code>."
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data == "admin:remove_operator")
 async def admin_remove_operator(callback: CallbackQuery, state: FSMContext):
@@ -4659,7 +4692,7 @@ async def admin_remove_operator(callback: CallbackQuery, state: FSMContext):
         f"{removable_text}\n\n"
         "Базовых операторов удалить нельзя."
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data == "admin:set_hold")
 async def admin_set_hold(callback: CallbackQuery, state: FSMContext):
@@ -4667,7 +4700,7 @@ async def admin_set_hold(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminStates.waiting_hold)
     await callback.message.answer("Введите новый Холд в минутах:")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:set_min_withdraw")
@@ -4676,7 +4709,7 @@ async def admin_set_min_withdraw(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminStates.waiting_min_withdraw)
     await callback.message.answer("Введите новый минимальный вывод в $:")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:treasury_add")
@@ -4685,7 +4718,7 @@ async def admin_treasury_add(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminStates.waiting_treasury_invoice)
     await callback.message.answer("Введите сумму пополнения казны в $ для создания <b>Crypto Bot invoice</b>:")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:treasury_sub")
@@ -4694,7 +4727,7 @@ async def admin_treasury_sub(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminStates.waiting_treasury_sub)
     await callback.message.answer("Введите сумму вывода казны в $ — будет создан <b>реальный чек Crypto Bot</b>:")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data.startswith("admin:set_price:"))
@@ -4715,7 +4748,7 @@ async def admin_set_price_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_operator_price)
     await state.update_data(operator_key=operator_key, price_mode=price_mode)
     await callback.message.answer(f"Введите новую цену для {op_text(operator_key)} • <b>{mode_label(price_mode)}</b> в $:")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data.startswith("admin:role:"))
@@ -4729,7 +4762,7 @@ async def admin_role_action(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_role_user)
     await state.update_data(role_target=role)
     await callback.message.answer("Отправьте ID пользователя, которому нужно назначить роль. Для снятия роли тоже отправьте ID.")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:ws_help_group")
@@ -4737,7 +4770,7 @@ async def admin_ws_help_group(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await callback.message.answer("Чтобы добавить рабочую группу, зайдите в нужную группу и отправьте команду <code>/work</code>.")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:ws_help_topic")
@@ -4745,7 +4778,7 @@ async def admin_ws_help_topic(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await callback.message.answer("Чтобы добавить рабочий топик, зайдите в нужный топик и отправьте команду <code>/topic</code>.")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.message(AdminStates.waiting_new_operator)
@@ -5325,7 +5358,7 @@ async def payout_link_cb(callback: CallbackQuery, state: FSMContext):
         render_withdraw_setup(),
         kb.as_markup(),
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data.startswith("submit_more:"))
 async def submit_more(callback: CallbackQuery, state: FSMContext):
@@ -5402,14 +5435,14 @@ async def takeop_callback(callback: CallbackQuery):
         await callback.message.answer_photo(item['qr_file_id'], caption=caption, reply_markup=admin_queue_kb(item))
     else:
         await callback.message.answer_photo(item['qr_file_id'], caption=caption, reply_markup=admin_queue_kb(item))
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "menu:submit")
 async def submit_start_cb(callback: CallbackQuery, state: FSMContext):
     if not await is_user_joined_required_group(callback.bot, callback.from_user.id):
         await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), '<b>🔒 Доступ ограничен</b>\n\nДля использования бота нужна обязательная подписка на группу.\n\nПосле вступления нажмите <b>«Проверить подписку»</b>.', required_join_kb().as_markup())
-        await callback.answer()
+        await safe_callback_answer(callback)
         return
     if is_user_blocked(callback.from_user.id):
         await callback.answer("Аккаунт заблокирован", show_alert=True)
@@ -5419,7 +5452,7 @@ async def submit_start_cb(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(SubmitStates.waiting_mode)
     await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), "<b>💫 ESIM Service X 💫</b>\n\n<b>📲 Сдать номер - ЕСИМ</b>\n\nСначала выберите режим работы для новой заявки:", mode_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "mode:back")
@@ -5429,13 +5462,13 @@ async def mode_back(callback: CallbackQuery, state: FSMContext):
         await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), blocked_text(), None)
     else:
         await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), render_start(callback.from_user.id), main_menu())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data.startswith("mode:"))
 async def choose_mode(callback: CallbackQuery, state: FSMContext):
     mode = callback.data.split(":", 1)[1]
     if mode not in {"hold", "no_hold"}:
-        await callback.answer()
+        await safe_callback_answer(callback)
         return
     await state.update_data(mode=mode)
     await state.set_state(SubmitStates.waiting_operator)
@@ -5452,14 +5485,14 @@ async def choose_mode(callback: CallbackQuery, state: FSMContext):
         f"<b>Режим выбран: {mode_title}</b>\n\n{mode_desc}\n\n👇 <b>Теперь выберите оператора:</b>",
         operators_kb(mode, "op", "op:back", callback.from_user.id),
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "op:back")
 async def op_back(callback: CallbackQuery, state: FSMContext):
     await state.set_state(SubmitStates.waiting_mode)
     await replace_banner_message(callback, db.get_setting('start_banner_path', START_BANNER), "<b>💫 ESIM Service X 💫</b>\n\n<b>📲 Сдать номер - ЕСИМ</b>\n\nСначала выберите режим работы для новой заявки:", mode_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data.startswith("op:"))
@@ -5481,7 +5514,7 @@ async def choose_operator(callback: CallbackQuery, state: FSMContext):
         "<b>💫 ESIM Service X 💫</b>\n\n<b>📨 Отправьте QR-код - Фото сообщением</b>\n\n👉 <b>Требуется:</b>\n▫️ Фото QR\n▫️ В подписи укажите номер\n\n🔰 <b>Допустимый формат номера:</b>\n<blockquote>+79991234567  «+7»\n79991234567   «7»\n89991234567   «8»</blockquote>\n\nЕсли передумали нажмите ниже - Отмена",
         cancel_inline_kb("op:back"),
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.message(WithdrawStates.waiting_amount, F.text == "↩️ Назад")
@@ -5631,7 +5664,7 @@ async def withdraw_cancel(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text("❌ Вывод отменён.")
     await send_banner_message(callback.message, db.get_setting('profile_banner_path', PROFILE_BANNER), render_profile(callback.from_user.id), profile_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data.startswith("withdraw_confirm:"))
@@ -5703,7 +5736,7 @@ async def withdraw_confirm(callback: CallbackQuery):
         "✅ Заявка на вывод создана. Она отправлена в канал выплат." if sent_ok else "⚠️ Заявка создана, но сообщение в канал выплат не отправилось. Проверь логи и настройки канала."
     )
     await send_banner_message(callback.message, db.get_setting('withdraw_banner_path', WITHDRAW_BANNER), render_withdraw(callback.from_user.id), cancel_inline_kb("menu:profile"))
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 
@@ -5807,7 +5840,7 @@ async def admin_home(callback: CallbackQuery, state: FSMContext):
         return
     await state.clear()
     await callback.message.edit_text(render_admin_home(), reply_markup=admin_root_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:summary")
@@ -5815,7 +5848,7 @@ async def admin_summary(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await callback.message.edit_text(render_admin_summary(), reply_markup=admin_summary_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:summary_by_date")
@@ -5824,7 +5857,7 @@ async def admin_summary_by_date(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminStates.waiting_summary_date)
     await callback.message.answer("📅 Введите дату в формате <code>ДД-ММ-ГГГГ</code> или <code>ДД.ММ.ГГГГ</code>.")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:treasury")
@@ -5832,7 +5865,7 @@ async def admin_treasury(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await callback.message.edit_text(render_admin_treasury(), reply_markup=treasury_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 
@@ -5853,14 +5886,14 @@ async def admin_treasury_check(callback: CallbackQuery):
         render_admin_treasury() + (f"\n\n✅ Подтверждено пополнений: <b>{usd(added)}</b>" if added else "\n\nПлатежей пока не найдено."),
         reply_markup=treasury_kb()
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data == "admin:withdraws")
 async def admin_withdraws(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await callback.message.edit_text(render_admin_withdraws(), reply_markup=admin_back_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:hold")
@@ -5868,7 +5901,7 @@ async def admin_hold(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await safe_edit_or_send(callback, render_admin_hold(), reply_markup=hold_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:prices")
@@ -5876,7 +5909,7 @@ async def admin_prices(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await safe_edit_or_send(callback, render_admin_prices(), reply_markup=prices_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:roles")
@@ -5884,7 +5917,7 @@ async def admin_roles(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await callback.message.edit_text(render_roles(), reply_markup=roles_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:workspaces")
@@ -5892,7 +5925,7 @@ async def admin_workspaces(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await callback.message.edit_text(render_workspaces(), reply_markup=workspaces_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:group_stats_panel")
@@ -5900,7 +5933,7 @@ async def admin_group_stats_panel(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await safe_edit_or_send(callback, "<b>📈 Выберите группу / топик для статистики:</b>", reply_markup=group_stats_list_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data.startswith("admin:groupstat:"))
 async def admin_groupstat_open(callback: CallbackQuery):
@@ -5911,7 +5944,7 @@ async def admin_groupstat_open(callback: CallbackQuery):
     thread = int(thread_id)
     thread = None if thread == 0 else thread
     await safe_edit_or_send(callback, render_single_group_stats(chat_id, thread), reply_markup=single_group_stats_kb(chat_id, thread))
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data.startswith("admin:group_remove:"))
 async def admin_group_remove_start(callback: CallbackQuery, state: FSMContext):
@@ -5942,7 +5975,7 @@ async def admin_settings(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await safe_edit_or_send(callback, render_admin_settings(), reply_markup=settings_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 
@@ -5951,7 +5984,7 @@ async def admin_operator_modes(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await safe_edit_or_send(callback, render_operator_modes(), reply_markup=operator_modes_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data.startswith("admin:toggle_avail:"))
 async def admin_toggle_avail(callback: CallbackQuery):
@@ -5968,7 +6001,7 @@ async def admin_design(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await callback.message.edit_text(render_design(), reply_markup=design_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:templates")
@@ -5976,7 +6009,7 @@ async def admin_templates(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await callback.message.edit_text(render_templates(), reply_markup=design_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:broadcast")
@@ -5984,7 +6017,7 @@ async def admin_broadcast(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await callback.message.edit_text(render_broadcast(), reply_markup=broadcast_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:broadcast_write")
@@ -5995,7 +6028,7 @@ async def admin_broadcast_write(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(
         "Отправьте текст рассылки одним сообщением.\n\nМожно использовать HTML Telegram: <code>&lt;b&gt;</code>, <code>&lt;i&gt;</code>, <code>&lt;blockquote&gt;</code>."
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:broadcast_preview")
@@ -6004,7 +6037,7 @@ async def admin_broadcast_preview(callback: CallbackQuery):
         return
     ad = db.get_setting("broadcast_text", "").strip()
     await callback.message.answer(ad or "Рассылка пока пустая.")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:broadcast_send_ad")
@@ -6023,7 +6056,7 @@ async def admin_broadcast_send_ad(callback: CallbackQuery):
         except Exception:
             pass
     await callback.message.answer(f"✅ Рассылка завершена. Доставлено: <b>{sent}</b>")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:usernames")
@@ -6033,7 +6066,7 @@ async def admin_usernames(callback: CallbackQuery):
     content = db.export_usernames().encode("utf-8")
     file = BufferedInputFile(content, filename="usernames.txt")
     await callback.message.answer_document(file, caption="📥 Собранные username и user_id")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:download_db")
@@ -6045,7 +6078,7 @@ async def admin_download_db(callback: CallbackQuery):
         await callback.answer("База не найдена", show_alert=True)
         return
     await callback.message.answer_document(FSInputFile(path), caption="<b>📦 SQLite база</b>")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data == "admin:upload_db")
 async def admin_upload_db(callback: CallbackQuery, state: FSMContext):
@@ -6053,7 +6086,7 @@ async def admin_upload_db(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminStates.waiting_db_upload)
     await callback.message.answer("<b>📥 Загрузка базы</b>\n\nПришлите файл <code>.db</code>, <code>.sqlite</code> или <code>.sqlite3</code>.")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:set_start_text")
@@ -6064,7 +6097,7 @@ async def admin_set_start_text(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(
         "Отправьте новый стартовый текст в формате:\n\n<code>Заголовок\nПодзаголовок\nОписание</code>\n\nПервые 2 строки пойдут в шапку, остальное в описание."
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:set_ad_text")
@@ -6075,7 +6108,7 @@ async def admin_set_ad_text(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(
         "Отправьте текст рассылки.\n\nМожно писать красивыми шаблонами и использовать HTML Telegram."
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:add_operator")
@@ -6090,7 +6123,7 @@ async def admin_add_operator(callback: CallbackQuery, state: FSMContext):
         "После этого бот отдельно попросит <b>premium emoji ID</b>.\n"
         "Команду указывать не нужно — она будет создана автоматически как <code>/key</code>."
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data == "admin:remove_operator")
 async def admin_remove_operator(callback: CallbackQuery, state: FSMContext):
@@ -6109,7 +6142,7 @@ async def admin_remove_operator(callback: CallbackQuery, state: FSMContext):
         f"{removable_text}\n\n"
         "Базовых операторов удалить нельзя."
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data == "admin:set_hold")
 async def admin_set_hold(callback: CallbackQuery, state: FSMContext):
@@ -6117,7 +6150,7 @@ async def admin_set_hold(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminStates.waiting_hold)
     await callback.message.answer("Введите новый Холд в минутах:")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:set_min_withdraw")
@@ -6126,7 +6159,7 @@ async def admin_set_min_withdraw(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminStates.waiting_min_withdraw)
     await callback.message.answer("Введите новый минимальный вывод в $:")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:treasury_add")
@@ -6135,7 +6168,7 @@ async def admin_treasury_add(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminStates.waiting_treasury_invoice)
     await callback.message.answer("Введите сумму пополнения казны в $ для создания <b>Crypto Bot invoice</b>:")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:treasury_sub")
@@ -6144,7 +6177,7 @@ async def admin_treasury_sub(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminStates.waiting_treasury_sub)
     await callback.message.answer("Введите сумму вывода казны в $ — будет создан <b>реальный чек Crypto Bot</b>:")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data.startswith("admin:set_price:"))
@@ -6165,7 +6198,7 @@ async def admin_set_price_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_operator_price)
     await state.update_data(operator_key=operator_key, price_mode=price_mode)
     await callback.message.answer(f"Введите новую цену для {op_text(operator_key)} • <b>{mode_label(price_mode)}</b> в $:")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data.startswith("admin:role:"))
@@ -6179,7 +6212,7 @@ async def admin_role_action(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_role_user)
     await state.update_data(role_target=role)
     await callback.message.answer("Отправьте ID пользователя, которому нужно назначить роль. Для снятия роли тоже отправьте ID.")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:ws_help_group")
@@ -6187,7 +6220,7 @@ async def admin_ws_help_group(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await callback.message.answer("Чтобы добавить рабочую группу, зайдите в нужную группу и отправьте команду <code>/work</code>.")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:ws_help_topic")
@@ -6195,7 +6228,7 @@ async def admin_ws_help_topic(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await callback.message.answer("Чтобы добавить рабочий топик, зайдите в нужный топик и отправьте команду <code>/topic</code>.")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.message(AdminStates.waiting_new_operator)
@@ -6768,20 +6801,20 @@ async def esim_command(message: Message):
 @router.callback_query(F.data == "esim:back_mode")
 async def esim_back_mode(callback: CallbackQuery):
     if not consume_event_once("cb_esim_back", callback.id):
-        await callback.answer()
+        await safe_callback_answer(callback)
         return
     if not is_operator_or_admin(callback.from_user.id):
         return
     text = "<b>📥 Выбор номера ESIM</b>\n\nСначала выберите режим, который нужен:"
     await safe_edit_or_send(callback, text, reply_markup=esim_mode_kb(callback.from_user.id))
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data.startswith("esim_mode:"))
 async def esim_choose_mode(callback: CallbackQuery):
     logging.info("esim_choose_mode callback=%s", callback.data)
     if not consume_event_once("cb_esim_mode", callback.id):
-        await callback.answer()
+        await safe_callback_answer(callback)
         return
     if not is_operator_or_admin(callback.from_user.id):
         return
@@ -6789,14 +6822,14 @@ async def esim_choose_mode(callback: CallbackQuery):
     text = f"<b>📥 Выбор номера ESIM</b>\n\nВыбран режим: <b>{mode_label(mode)}</b>\n👇 Теперь выберите оператора:\n<i>Цена указана прямо в кнопках.</i>"
     thread_id = getattr(callback.message, 'message_thread_id', None)
     await safe_edit_or_send(callback, text, reply_markup=operators_group_kb(callback.message.chat.id, thread_id, mode, 'esim_take', 'esim:back_mode'))
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data.startswith("esim_take:"))
 async def esim_take(callback: CallbackQuery):
     logging.info("esim_take callback=%s", callback.data)
     if not consume_event_once("cb_esim_take", callback.id):
-        await callback.answer()
+        await safe_callback_answer(callback)
         return
     if not is_operator_or_admin(callback.from_user.id):
         return
@@ -6990,7 +7023,7 @@ async def admin_queues(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await safe_edit_or_send(callback, render_admin_queue_text(), reply_markup=queue_manage_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data == "admin:user_tools")
 async def admin_user_tools(callback: CallbackQuery, state: FSMContext):
@@ -7002,7 +7035,7 @@ async def admin_user_tools(callback: CallbackQuery, state: FSMContext):
         "<b>👤 Пользователь</b>\n\nВыберите действие ниже, затем отправьте ID, @username или номер следующим сообщением.",
         reply_markup=user_admin_kb(),
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data.in_(["admin:user_stats", "admin:user_set_price", "admin:user_pm", "admin:user_add_balance", "admin:user_sub_balance", "admin:user_ban", "admin:user_unban"]))
 async def admin_user_action_pick(callback: CallbackQuery, state: FSMContext):
@@ -7031,7 +7064,7 @@ async def admin_user_action_pick(callback: CallbackQuery, state: FSMContext):
         "unban": "<b>Отправьте ID, @username или номер пользователя для разблокировки:</b>",
     }
     await callback.message.answer(prompts.get(action, "<b>Отправьте ID, @username или номер пользователя:</b>"))
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.message(AdminStates.waiting_user_action_id)
 async def admin_user_action_id(message: Message, state: FSMContext):
@@ -7138,7 +7171,7 @@ async def admin_user_price_op(callback: CallbackQuery):
     logging.info("admin_user_price_op callback=%s", callback.data)
     if not is_admin(callback.from_user.id):
         return
-    await callback.answer()
+    await safe_callback_answer(callback)
     _, _, uid, operator_key = callback.data.split(":")
     await callback.message.answer(
         f"<b>Пользователь:</b> <code>{uid}</code>\n<b>Оператор:</b> {op_text(operator_key)}\n\n<b>Выберите режим:</b>",
@@ -7150,7 +7183,7 @@ async def admin_user_price_mode(callback: CallbackQuery, state: FSMContext):
     logging.info("admin_user_price_mode callback=%s", callback.data)
     if not is_admin(callback.from_user.id):
         return
-    await callback.answer()
+    await safe_callback_answer(callback)
     _, _, uid, operator_key, mode = callback.data.split(":")
     await state.set_state(AdminStates.waiting_user_price_value)
     await state.update_data(target_user_id=int(uid), operator_key=operator_key, price_mode=mode)
@@ -7472,17 +7505,17 @@ async def admin_user_action_pick(callback: CallbackQuery, state: FSMContext):
     if action == "stats":
         await state.set_state(AdminStates.waiting_user_stats_lookup)
         await callback.message.answer("<b>Введите ID, @username или сданный номер пользователя:</b>", reply_markup=ForceReply(selective=True))
-        await callback.answer()
+        await safe_callback_answer(callback)
         return
     if action == "set_price":
         await state.set_state(AdminStates.waiting_user_price_lookup)
         await callback.message.answer("<b>Введите ID, @username или сданный номер пользователя для персонального прайса:</b>", reply_markup=ForceReply(selective=True))
-        await callback.answer()
+        await safe_callback_answer(callback)
         return
     await state.update_data(user_action=action)
     await state.set_state(AdminStates.waiting_user_action_id)
     await callback.message.answer("<b>Введите ID, @username или сданный номер пользователя:</b>", reply_markup=ForceReply(selective=True))
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.message(AdminStates.waiting_user_stats_lookup)
 async def admin_user_stats_lookup(message: Message, state: FSMContext):
@@ -7549,7 +7582,7 @@ async def admin_user_price_back_ops(callback: CallbackQuery):
         return
     uid = int(callback.data.split(":")[-1])
     await safe_edit_or_send(callback, "<b>Выберите оператора:</b>", reply_markup=user_price_operator_kb(uid))
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data.startswith("admin:user_price_op:"))
 async def admin_user_price_op(callback: CallbackQuery):
@@ -7563,7 +7596,7 @@ async def admin_user_price_op(callback: CallbackQuery):
         f"<b>Пользователь:</b> <code>{uid}</code>\n<b>Оператор:</b> {op_text(operator_key)}\n\n<b>Выберите режим:</b>",
         reply_markup=user_price_mode_kb(int(uid), operator_key),
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data.startswith("admin:user_price_mode:"))
 async def admin_user_price_mode(callback: CallbackQuery, state: FSMContext):
@@ -7581,7 +7614,7 @@ async def admin_user_price_mode(callback: CallbackQuery, state: FSMContext):
         "Введите сумму числом.\nЧтобы удалить персональный прайс, отправьте: <code>reset</code>",
         reply_markup=cancel_inline_kb("admin:user_tools"),
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.message(AdminStates.waiting_user_price_value)
 async def admin_user_price_value(message: Message, state: FSMContext):
@@ -7816,7 +7849,7 @@ async def admin_set_withdraw_channel(callback: CallbackQuery, state: FSMContext)
         "Введите новый <b>ID канала выплат</b>:\n"
         f"Текущее значение: <code>{current_value}</code>"
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:set_withdraw_topic")
@@ -7832,7 +7865,7 @@ async def admin_set_withdraw_topic(callback: CallbackQuery, state: FSMContext):
         "Отправь <code>0</code>, чтобы отключить топик и слать выплаты просто в канал.\n"
         f"Текущее значение: <code>{current_value}</code>"
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:set_backup_channel")
@@ -7847,7 +7880,7 @@ async def admin_set_backup_channel(callback: CallbackQuery, state: FSMContext):
         "Введите новый <b>ID канала автобэкапа</b>:\n"
         f"Текущее значение: <code>{current_value}</code>"
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "admin:toggle_backup")
@@ -7869,7 +7902,7 @@ async def admin_set_log_channel(callback: CallbackQuery, state: FSMContext):
     await state.update_data(channel_target="log_channel_id")
     await state.set_state(AdminStates.waiting_channel_value)
     await callback.message.answer("Введите новый <b>ID канала логов</b>:")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data == "admin:required_join_manage")
 async def admin_required_join_manage(callback: CallbackQuery):
@@ -7877,7 +7910,7 @@ async def admin_required_join_manage(callback: CallbackQuery):
         await callback.answer("Только главный админ", show_alert=True)
         return
     await safe_edit_or_send(callback, render_required_join_admin(), reply_markup=required_join_manage_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data == "admin:required_join_add")
 async def admin_required_join_add(callback: CallbackQuery, state: FSMContext):
@@ -7890,7 +7923,7 @@ async def admin_required_join_add(callback: CallbackQuery, state: FSMContext):
         "<code>-100xxxxxxxxxx | https://t.me/your_link | Название</code>\n\n"
         "Название можно не указывать. Для отмены отправь <code>-</code>."
     )
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data == "admin:required_join_remove")
 async def admin_required_join_remove(callback: CallbackQuery, state: FSMContext):
@@ -7907,7 +7940,7 @@ async def admin_required_join_remove(callback: CallbackQuery, state: FSMContext)
         title = escape(item.get("title") or f"Канал {idx}")
         lines.append(f"{idx}. {title} — <code>{item['chat_id']}</code>")
     await callback.message.answer("\n".join(lines))
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data == "admin:required_join_clear")
 async def admin_required_join_clear(callback: CallbackQuery):
@@ -8017,7 +8050,7 @@ async def admin_group_finance_panel(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await safe_edit_or_send(callback, "<b>🏦 Выберите группу / топик для казны:</b>", reply_markup=group_finance_list_kb())
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data.startswith("admin:groupfin:"))
 async def admin_group_finance_open(callback: CallbackQuery):
@@ -8027,7 +8060,7 @@ async def admin_group_finance_open(callback: CallbackQuery):
     chat_id = int(chat_id)
     thread_id = None if int(thread_id) == 0 else int(thread_id)
     await safe_edit_or_send(callback, render_group_finance(chat_id, thread_id), reply_markup=group_finance_manage_kb(chat_id, thread_id))
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.callback_query(F.data.startswith("admin:groupfin_add:"))
 @router.callback_query(F.data.startswith("admin:groupfin_sub:"))
@@ -8043,7 +8076,7 @@ async def admin_group_finance_change_start(callback: CallbackQuery, state: FSMCo
     title = escape(workspace_display_title(chat_id, thread_id))
     label = f"<code>{chat_id}</code>" + (f" / topic <code>{thread_id}</code>" if thread_id else "")
     await callback.message.answer(f"Введите сумму для действия <b>{'пополнить' if action == 'add' else 'списать'}</b> в группе <b>{title}</b>\n{label}:")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.message(AdminStates.waiting_group_finance_amount)
 async def admin_group_finance_amount(message: Message, state: FSMContext):
@@ -8081,7 +8114,7 @@ async def admin_group_price_start(callback: CallbackQuery, state: FSMContext):
     await state.update_data(group_price_chat_id=int(chat_id), group_price_thread_id=thread_id, price_mode=mode, operator_key=operator_key)
     label = f"<code>{chat_id}</code>" + (f" / topic <code>{thread_id}</code>" if thread_id else "")
     await callback.message.answer(f"Введите цену для группы {label}: {op_text(operator_key)} • <b>{mode_label(mode)}</b>")
-    await callback.answer()
+    await safe_callback_answer(callback)
 
 @router.message(AdminStates.waiting_group_price_value)
 async def admin_group_price_value(message: Message, state: FSMContext):
