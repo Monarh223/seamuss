@@ -261,6 +261,9 @@ class QueueItem:
     charge_amount: Optional[float] = None
     user_hold_chat_id: Optional[int] = None
     user_hold_message_id: Optional[int] = None
+    qr_blob: Optional[bytes] = None
+    qr_mime: Optional[str] = None
+    qr_filename: Optional[str] = None
 
     @classmethod
     def from_row(cls, row):
@@ -361,6 +364,9 @@ class Database:
                 phone_label TEXT NOT NULL,
                 normalized_phone TEXT NOT NULL,
                 qr_file_id TEXT NOT NULL,
+                qr_blob BLOB,
+                qr_mime TEXT,
+                qr_filename TEXT,
                 status TEXT NOT NULL,
                 price REAL NOT NULL,
                 created_at TEXT NOT NULL,
@@ -1995,7 +2001,8 @@ def render_my_numbers(user_id: int, page: int = 0) -> str:
             pos_text = f" • <b>позиция:</b> {pos}" if pos else ""
             rows.append(
                 f"#{row['id']} • {op_text(row['operator_key'])} • {mode_label(row['mode'])} • "
-                f"{pretty_phone(row['normalized_phone'])} • <b>{status_label_from_row(row)}</b>{pos_text}"
+                f"{pretty_phone(row['normalized_phone'])} • 🏷 <b>Прайс сдачи:</b> {usd(float(row['price'] or 0))} • "
+                f"<b>{status_label_from_row(row)}</b>{pos_text}"
             )
         body = "\n".join(rows) or "• На этой странице пусто."
     page_line = f"\n\n<b>Страница:</b> {page + 1}/{max_page + 1} • <b>Всего активных:</b> {total}" if total else ""
@@ -2463,6 +2470,12 @@ def ensure_extra_schema():
     wd_cols = {r['name'] for r in cur.execute("PRAGMA table_info(withdrawals)").fetchall()}
     ws_cols = {r['name'] for r in cur.execute("PRAGMA table_info(workspaces)").fetchall()}
     qi_cols = {r['name'] for r in cur.execute("PRAGMA table_info(queue_items)").fetchall()}
+    if 'qr_blob' not in qi_cols:
+        cur.execute("ALTER TABLE queue_items ADD COLUMN qr_blob BLOB")
+    if 'qr_mime' not in qi_cols:
+        cur.execute("ALTER TABLE queue_items ADD COLUMN qr_mime TEXT")
+    if 'qr_filename' not in qi_cols:
+        cur.execute("ALTER TABLE queue_items ADD COLUMN qr_filename TEXT")
     if 'submit_bot_token' not in qi_cols:
         cur.execute("ALTER TABLE queue_items ADD COLUMN submit_bot_token TEXT")
     if 'charge_chat_id' not in qi_cols:
@@ -2673,18 +2686,31 @@ def queue_order_sql(prefix: str = "") -> str:
     return f"CASE WHEN {prefix}user_id IN ({priority_ids_sql}) THEN 0 ELSE 1 END, {prefix}created_at ASC, {prefix}id ASC"
 
 
-def create_queue_item_ext(user_id: int, username: str, full_name: str, operator_key: str, normalized_phone: str, qr_file_id: str, mode: str, submit_bot_token: str | None = None):
+async def download_message_photo_bytes(bot: Bot, file_id: str) -> tuple[bytes | None, str, str]:
+    try:
+        tg_file = await bot.get_file(file_id)
+        buf = io.BytesIO()
+        await bot.download_file(tg_file.file_path, destination=buf)
+        data = buf.getvalue()
+        ext = Path(tg_file.file_path or '').suffix or '.jpg'
+        return data, 'image/jpeg', f'qr{ext}'
+    except Exception:
+        logging.exception('failed to persist QR photo bytes for file_id=%s', file_id)
+        return None, '', ''
+
+
+def create_queue_item_ext(user_id: int, username: str, full_name: str, operator_key: str, normalized_phone: str, qr_file_id: str, mode: str, submit_bot_token: str | None = None, qr_blob: bytes | None = None, qr_mime: str | None = None, qr_filename: str | None = None):
     cur = db.conn.cursor()
     cur.execute(
         """
         INSERT INTO queue_items (
             user_id, username, full_name, operator_key, phone_label, normalized_phone,
-            qr_file_id, status, price, created_at, mode, submit_bot_token
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
+            qr_file_id, qr_blob, qr_mime, qr_filename, status, price, created_at, mode, submit_bot_token
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
         """,
         (
             user_id, username, full_name, operator_key, pretty_phone(normalized_phone), normalized_phone,
-            qr_file_id, get_mode_price(operator_key, mode, user_id), now_str(), mode, queue_item_store_submit_token(submit_bot_token)
+            qr_file_id, qr_blob, qr_mime, qr_filename, get_mode_price(operator_key, mode, user_id), now_str(), mode, queue_item_store_submit_token(submit_bot_token)
         ),
     )
     db.conn.commit()
@@ -2868,8 +2894,26 @@ async def send_queue_item_photo_to_chat(target_bot: Bot, chat_id: int, item, cap
         )
         direct_exc = exc
 
-    # 2) If direct file_id failed, try downloading via the original submit bot
-    # token and re-uploading. Skip revoked/invalid old tokens instead of crashing.
+    # 2) Portable DB fallback: if the DB was moved to another bot, re-upload saved bytes.
+    try:
+        blob = getattr(item, 'qr_blob', None)
+        if blob is None and hasattr(item, 'keys') and 'qr_blob' in item.keys():
+            blob = item['qr_blob']
+        if blob:
+            if isinstance(blob, memoryview):
+                blob = blob.tobytes()
+            filename = getattr(item, 'qr_filename', None) or f"queue_{getattr(item, 'id', 'item')}.jpg"
+            if hasattr(item, 'keys') and 'qr_filename' in item.keys() and item['qr_filename']:
+                filename = item['qr_filename']
+            upload = BufferedInputFile(bytes(blob), filename=filename)
+            return await target_bot.send_photo(
+                chat_id, upload, caption=caption, reply_markup=reply_markup,
+                message_thread_id=message_thread_id
+            )
+    except Exception:
+        logging.exception('send_queue_item_photo_to_chat qr_blob fallback failed item_id=%s chat_id=%s', getattr(item, 'id', '?'), chat_id)
+
+    # 3) If direct file_id and DB blob failed, try live mirror token only.
     try:
         if token == getattr(target_bot, 'token', None) or not is_live_mirror_token(token):
             raise direct_exc
@@ -2891,7 +2935,7 @@ async def send_queue_item_photo_to_chat(target_bot: Bot, chat_id: int, item, cap
             'send_queue_item_photo_to_chat source fallback failed item_id=%s chat_id=%s submit_token_old=%s; sending text card without photo',
             getattr(item, 'id', '?'), chat_id, bool(token and token != getattr(target_bot, 'token', None))
         )
-        # 3) Last fallback: do not break taking a number. Send the card as text
+        # 4) Last fallback: do not break taking a number. Send the card as text
         # so the workflow continues instead of raising TelegramUnauthorizedError.
         safe_caption = caption + "\n\n⚠️ Фото/QR этой старой заявки недоступно после смены токена. Попросите пользователя переотправить номер, если нужен QR."
         return await target_bot.send_message(
@@ -3796,6 +3840,7 @@ async def submit_qr(message: Message, state: FSMContext):
         await message.answer("<b>⛔ Этот номер уже был оплачен.</b>\n\nПовторно поставить уже оплаченный номер нельзя.", reply_markup=cancel_inline_kb())
         return
     file_id = message.photo[-1].file_id
+    qr_blob, qr_mime, qr_filename = await download_message_photo_bytes(message.bot, file_id)
     item_id = create_queue_item_ext(
         message.from_user.id,
         message.from_user.username or "",
@@ -3805,6 +3850,9 @@ async def submit_qr(message: Message, state: FSMContext):
         file_id,
         mode,
         getattr(message.bot, "token", BOT_TOKEN),
+        qr_blob,
+        qr_mime,
+        qr_filename,
     )
     await state.update_data(operator_key=operator_key, mode=mode)
     await send_log(
@@ -5282,6 +5330,7 @@ async def submit_qr(message: Message, state: FSMContext):
         await message.answer("<b>⛔ Этот номер уже был оплачен.</b>\n\nПовторно поставить уже оплаченный номер нельзя.", reply_markup=cancel_inline_kb())
         return
     file_id = message.photo[-1].file_id
+    qr_blob, qr_mime, qr_filename = await download_message_photo_bytes(message.bot, file_id)
     item_id = create_queue_item_ext(
         message.from_user.id,
         message.from_user.username or "",
@@ -5291,6 +5340,9 @@ async def submit_qr(message: Message, state: FSMContext):
         file_id,
         mode,
         getattr(message.bot, "token", BOT_TOKEN),
+        qr_blob,
+        qr_mime,
+        qr_filename,
     )
     await state.update_data(operator_key=operator_key, mode=mode)
     await send_log(
@@ -7088,7 +7140,8 @@ async def take_start_cb(callback: CallbackQuery):
                 "🚀 <b>По вашему номеру началась работа</b>\n\n"
                 f"📞 <b>Номер:</b> <code>{escape(pretty_phone(fresh.normalized_phone))}</code>\n"
                 f"📱 <b>Оператор:</b> {op_html(fresh.operator_key)}\n"
-                f"{mode_emoji(fresh.mode)} <b>Режим:</b> {mode_label(fresh.mode)}"
+                f"{mode_emoji(fresh.mode)} <b>Режим:</b> {mode_label(fresh.mode)}\n"
+                f"🏷 <b>Прайс сдачи:</b> {usd(float(fresh.price))}"
             )
     except Exception:
         pass
@@ -7201,7 +7254,7 @@ async def slip_cb(callback: CallbackQuery):
                 await callback.bot.edit_message_caption(
                     chat_id=item.user_hold_chat_id,
                     message_id=item.user_hold_message_id,
-                    caption=slip_text,
+                    caption=user_slip_text,
                     reply_markup=None,
                 )
             except Exception:
