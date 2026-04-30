@@ -1845,21 +1845,76 @@ def referral_kb(user_id: int):
 
 
 def render_start(user_id: int) -> str:
+    """Главное меню: полный текст + прайсы и очереди в одной плашке.
+
+    Telegram caption имеет лимит 1024 символа. Чтобы /start снова уходил
+    одним сообщением (фото + текст + кнопки), здесь используем лёгкий текст
+    без тяжёлой HTML-разметки и держим прайсы/очереди компактно.
+    """
     user = db.get_user(user_id)
     balance = usd(float(user["balance"] if user else 0))
     username = f"@{escape(user['username'])}" if user and user["username"] else "—"
-    title = escape(db.get_setting("start_title", "ESIM Service X"))
-    subtitle = escape(db.get_setting("start_subtitle", "Премиум сервис приёма номеров"))
-    description = db.get_setting("start_description", "🚀 <b>Быстрый приём заявок</b> • 💎 <b>Стабильные выплаты</b>")
-    return (
-        f"<b>💫 {title} 💫</b>\n"
-        f"{subtitle}\n\n"
-        f"{description}\n\n"
-        f"🔗 <b>Username:</b> {username}\n"
-        f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
-        f"💰 <b>Баланс:</b> <b>{balance}</b>\n\n"
-        f"👇 <b>Выберите нужное действие ниже:</b>"
-    )[:980]
+    title = _strip_html_tags(db.get_setting("start_title", "ESIM Service X"))
+    subtitle = _strip_html_tags(db.get_setting("start_subtitle", "Премиум сервис приёма номеров"))
+    description = _strip_html_tags(db.get_setting(
+        "start_description",
+        "🚀 Быстрый приём заявок • 💎 Стабильные выплаты • 🛡 Контроль статусов"
+    ))
+
+    lines = [
+        f"💫 {title} 💫",
+        subtitle,
+        "",
+        description,
+        "",
+        f"🔗 Username: {username}",
+        f"🆔 ID: {user_id}",
+        f"💰 Баланс: {balance}",
+        "",
+        "💎 Прайсы и очереди:",
+    ]
+
+    # Только основные операторы, без восстановленных мусорных ключей из старых БД.
+    for key in OPERATORS.keys():
+        if key not in PERMANENT_OPERATOR_KEYS:
+            continue
+        data = OPERATORS.get(key, {})
+        emoji = (CUSTOM_OPERATOR_EMOJI.get(key, ("", "📞"))[1] or "📞").strip()
+        title_op = _strip_html_tags(str(data.get("title", key)))
+        hold_price = usd(get_mode_price(key, "hold", user_id))
+        no_hold_price = usd(get_mode_price(key, "no_hold", user_id))
+        q_hold = count_waiting_mode(key, "hold")
+        q_no_hold = count_waiting_mode(key, "no_hold")
+        lines.append(f"{emoji} {title_op} — {hold_price} / {no_hold_price}")
+        lines.append(f"Очередь: {q_hold}/{q_no_hold}")
+
+    lines.extend([
+        "",
+        "Вы находитесь в главном меню.",
+        "👇 Выберите нужное действие ниже:",
+    ])
+
+    text = "\n".join(lines).strip()
+    if len(text) > 1024:
+        # Если админ в настройках поставил слишком длинный заголовок/описание,
+        # сокращаем только описание, не убирая прайсы и очереди.
+        lines[3] = "🚀 Быстрый приём заявок • 💎 Стабильные выплаты • 🛡 Контроль статусов"
+        text = "\n".join(lines).strip()
+    if len(text) > 1024:
+        # Последняя страховка: очередь и прайсы остаются в той же плашке, но в 1 строку.
+        compact = lines[:10]
+        for key in OPERATORS.keys():
+            if key not in PERMANENT_OPERATOR_KEYS:
+                continue
+            data = OPERATORS.get(key, {})
+            emoji = (CUSTOM_OPERATOR_EMOJI.get(key, ("", "📞"))[1] or "📞").strip()
+            title_op = _strip_html_tags(str(data.get("title", key)))
+            compact.append(
+                f"{emoji} {title_op} — {usd(get_mode_price(key, 'hold', user_id))}/{usd(get_mode_price(key, 'no_hold', user_id))} • Оч: {count_waiting_mode(key, 'hold')}/{count_waiting_mode(key, 'no_hold')}"
+            )
+        compact.extend(["", "Вы находитесь в главном меню.", "👇 Выберите нужное действие ниже:"])
+        text = "\n".join(compact).strip()[:1024]
+    return text
 
 def render_profile(user_id: int) -> str:
     """Безопасный профиль: не падает, даже если в старой БД не хватает полей/операторов."""
