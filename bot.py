@@ -127,6 +127,24 @@ OPERATOR_KEY_ALIASES = {
     "mega": "megafon", "t2": "tele2", "tele2slaon": "tele2salon", "tele2_salon": "tele2salon",
     "gaz": "gazprom", "dobro": "dobrosvyz", "dobrosvyaz": "dobrosvyz",
 }
+
+def is_operator_hidden_setting(operator_key: str) -> bool:
+    try:
+        return str(db.get_setting(f"operator_hidden_{normalize_operator_key(operator_key)}", "0")) == "1"
+    except Exception:
+        return False
+
+def is_operator_visible(operator_key: str) -> bool:
+    key = normalize_operator_key(operator_key)
+    if key not in OPERATORS:
+        return False
+    if key not in ACTIVE_OPERATOR_KEYS:
+        return False
+    return not is_operator_hidden_setting(key)
+
+def visible_operator_keys() -> list[str]:
+    return [k for k in OPERATORS.keys() if is_operator_visible(k)]
+
 # =========================================================
 
 START_BANNER = "start_banner.jpg"
@@ -1867,9 +1885,7 @@ def render_start(user_id: int) -> str:
         return f"${v:.2f}".rstrip("0").rstrip(".")
 
     price_rows: list[str] = []
-    for key in OPERATORS.keys():
-        if key not in PERMANENT_OPERATOR_KEYS:
-            continue
+    for key in visible_operator_keys():
         data = OPERATORS.get(key, {})
         emoji = op_emoji_html(key)
         title_op = escape(str(data.get("title", key)))
@@ -1900,9 +1916,7 @@ def render_start(user_id: int) -> str:
     # но не отправляем вторую плашку.
     if _html_visible_len(text) > 1000:
         price_rows = []
-        for key in OPERATORS.keys():
-            if key not in PERMANENT_OPERATOR_KEYS:
-                continue
+        for key in visible_operator_keys():
             data = OPERATORS.get(key, {})
             # ВАЖНО: даже в компактном режиме оставляем premium emoji через <tg-emoji>.
             emoji = op_emoji_html(key)
@@ -2679,7 +2693,7 @@ def upsert_custom_operator_store(key: str, title: str, price: float, command: st
             item.update(payload)
             found = True
             break
-    base_keys = PERMANENT_OPERATOR_KEYS
+    base_keys = set(visible_operator_keys())
     if not found and key not in base_keys:
         items.append(payload)
     db.set_setting('extra_operators_json', json.dumps(items, ensure_ascii=False))
@@ -3461,6 +3475,32 @@ def restore_operators_from_db_anywhere():
 restore_operators_from_db_anywhere()
 enforce_permanent_operators()
 logging.info("operators loaded final: %s", sorted(OPERATORS.keys()))
+
+
+def hide_operator_everywhere(operator_key: str):
+    """Hide/delete any operator, including built-in permanent operators.
+
+    Old queue history is not deleted. The operator just disappears from /start,
+    /esim and admin operator lists until added/enabled again.
+    """
+    key = normalize_operator_key(operator_key)
+    db.set_setting(f"operator_hidden_{key}", "1")
+    ACTIVE_OPERATOR_KEYS.discard(key)
+    try:
+        db.conn.execute("UPDATE custom_operators SET is_deleted=1 WHERE key=?", (key,))
+        db.conn.commit()
+    except Exception:
+        logging.exception("hide_operator_everywhere custom_operators update failed key=%s", key)
+
+def unhide_operator_everywhere(operator_key: str):
+    key = normalize_operator_key(operator_key)
+    db.set_setting(f"operator_hidden_{key}", "0")
+    ACTIVE_OPERATOR_KEYS.add(key)
+    try:
+        db.conn.execute("UPDATE custom_operators SET is_deleted=0 WHERE key=?", (key,))
+        db.conn.commit()
+    except Exception:
+        pass
 
 def op_emoji_html(operator_key: str) -> str:
     emoji_id, fallback = CUSTOM_OPERATOR_EMOJI.get(operator_key, ("", "📱"))
@@ -4800,7 +4840,7 @@ async def admin_remove_operator(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminStates.waiting_remove_operator)
     removable = []
-    base_keys = PERMANENT_OPERATOR_KEYS
+    base_keys = set(visible_operator_keys())
     for key, data in OPERATORS.items():
         if key not in base_keys:
             removable.append(f"• <code>{key}</code> — {escape(data.get('title', key))}")
@@ -4967,7 +5007,7 @@ async def admin_new_operator_emoji_value(message: Message, state: FSMContext):
                 return
 
     extra_items = load_extra_operator_items()
-    base_keys = PERMANENT_OPERATOR_KEYS
+    base_keys = set(visible_operator_keys())
     item_payload = {'key': key, 'title': title, 'price': price, 'command': command, 'emoji_id': emoji_id, 'emoji': fallback_emoji}
     updated = False
     for item in extra_items:
@@ -5000,7 +5040,7 @@ async def admin_remove_operator_value(message: Message, state: FSMContext):
     if not key:
         await message.answer("Отправьте key оператора.")
         return
-    base_keys = PERMANENT_OPERATOR_KEYS
+    base_keys = set(visible_operator_keys())
     if key in base_keys:
         await message.answer("Базового оператора удалить нельзя.")
         return
@@ -6256,7 +6296,7 @@ async def admin_remove_operator(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminStates.waiting_remove_operator)
     removable = []
-    base_keys = PERMANENT_OPERATOR_KEYS
+    base_keys = set(visible_operator_keys())
     for key, data in OPERATORS.items():
         if key not in base_keys:
             removable.append(f"• <code>{key}</code> — {escape(data.get('title', key))}")
@@ -6423,7 +6463,7 @@ async def admin_new_operator_emoji_value(message: Message, state: FSMContext):
                 return
 
     extra_items = load_extra_operator_items()
-    base_keys = PERMANENT_OPERATOR_KEYS
+    base_keys = set(visible_operator_keys())
     item_payload = {'key': key, 'title': title, 'price': price, 'command': command, 'emoji_id': emoji_id, 'emoji': fallback_emoji}
     updated = False
     for item in extra_items:
@@ -6458,7 +6498,7 @@ async def admin_remove_operator_value(message: Message, state: FSMContext):
     if not key:
         await message.answer("Отправьте key оператора.")
         return
-    base_keys = PERMANENT_OPERATOR_KEYS
+    base_keys = set(visible_operator_keys())
     if key in base_keys:
         await message.answer("Базового оператора удалить нельзя.")
         return
