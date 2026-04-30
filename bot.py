@@ -3435,33 +3435,58 @@ async def safe_callback_answer(callback: CallbackQuery, text: str | None = None,
         raise
 
 
-def _split_caption_for_photo(caption: str) -> tuple[str, str]:
-    """Telegram photo caption limit is 1024 chars. Keep photo safe and send rest separately."""
-    caption = caption or ""
-    if len(caption) <= 1000:
-        return caption, ""
-    cut = caption.rfind("\n", 0, 980)
-    if cut < 300:
-        cut = 980
-    first = caption[:cut].rstrip()
-    rest = caption[cut:].lstrip()
-    return first, rest
+def _html_balance_patch(text: str) -> str:
+    """Small guard for admin-entered HTML: close common tags if they were left open."""
+    text = text or ""
+    for tag in ("blockquote", "b", "i", "u", "s", "code", "pre"):
+        opened = text.count(f"<{tag}>")
+        closed = text.count(f"</{tag}>")
+        if opened > closed:
+            text += (f"</{tag}>" * (opened - closed))
+    return text
+
+
+def _strip_html_tags(text: str) -> str:
+    import re
+    return re.sub(r"<[^>]+>", "", text or "")
+
+
+async def _answer_html_safe(target, text: str, reply_markup=None):
+    text = _html_balance_patch(text or "")
+    try:
+        return await target.answer(text, reply_markup=reply_markup)
+    except TelegramBadRequest as e:
+        err = str(e)
+        logging.warning("html send failed, fallback plain: %s", err)
+        if "can't parse entities" in err or "Cant parse entities" in err:
+            return await target.answer(_strip_html_tags(text), reply_markup=reply_markup)
+        raise
 
 
 async def send_banner_message(entity, banner_path: str, caption: str, reply_markup=None):
     target = entity if isinstance(entity, Message) else entity.message
+    caption = _html_balance_patch(caption or "")
     if Path(banner_path).exists():
-        photo_caption, rest_text = _split_caption_for_photo(caption)
+        # HTML нельзя резать посередине: Telegram ломает <blockquote>.
+        # Большой текст отправляем отдельно от баннера, полностью сохраняя HTML.
+        if len(caption) <= 900:
+            try:
+                if hasattr(entity, 'answer_photo'):
+                    return await entity.answer_photo(FSInputFile(banner_path), caption=caption, reply_markup=reply_markup)
+                return await entity.message.answer_photo(FSInputFile(banner_path), caption=caption, reply_markup=reply_markup)
+            except TelegramBadRequest as e:
+                err = str(e)
+                logging.warning("photo caption failed, sending photo + text separately: %s", err)
+                if "can't parse entities" not in err and "caption is too long" not in err:
+                    raise
         if hasattr(entity, 'answer_photo'):
-            sent = await entity.answer_photo(FSInputFile(banner_path), caption=photo_caption, reply_markup=(reply_markup if not rest_text else None))
-            if rest_text:
-                await entity.answer(rest_text, reply_markup=reply_markup)
+            sent = await entity.answer_photo(FSInputFile(banner_path))
+            await _answer_html_safe(entity, caption, reply_markup=reply_markup)
             return sent
-        sent = await entity.message.answer_photo(FSInputFile(banner_path), caption=photo_caption, reply_markup=(reply_markup if not rest_text else None))
-        if rest_text:
-            await entity.message.answer(rest_text, reply_markup=reply_markup)
+        sent = await entity.message.answer_photo(FSInputFile(banner_path))
+        await _answer_html_safe(entity.message, caption, reply_markup=reply_markup)
         return sent
-    return await target.answer(caption, reply_markup=reply_markup)
+    return await _answer_html_safe(target, caption, reply_markup=reply_markup)
 
 
 async def replace_banner_message(callback: CallbackQuery, banner_path: str, caption: str, reply_markup=None):
