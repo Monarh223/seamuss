@@ -24,7 +24,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, Message, ForceReply, InlineKeyboardButton
+from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, Message, ForceReply, InlineKeyboardButton, MenuButtonCommands
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # =========================================================
@@ -110,16 +110,22 @@ OPERATORS = {
     "vtb": {"title": "ВТБ", "price": 20.00, "command": "/vtb"},
     "gazprom": {"title": "Газпром", "price": 22.00, "command": "/gazprom"},
     "miranda": {"title": "Миранда", "price": 15.00, "command": "/miranda"},
+    "dobrosvyz": {"title": "Добросвязь", "price": 8.00, "command": "/dobrosvyz"},
+}
+DEFAULT_GROUP_PRICES = {
+    "mts": 18.00, "mtssalon": 18.00, "bil": 17.00, "bilsalon": 17.00,
+    "tele2": 0.00, "tele2salon": 0.00, "sber": 12.00, "megafon": 0.00,
+    "vtb": 0.00, "gazprom": 0.00, "miranda": 15.00, "dobrosvyz": 8.00,
 }
 BASE_OPERATOR_KEYS = set(OPERATORS.keys())
 PERMANENT_OPERATOR_CONFIG = {k: dict(v) for k, v in OPERATORS.items()}
 PERMANENT_OPERATOR_KEYS = set(PERMANENT_OPERATOR_CONFIG.keys())
+ACTIVE_OPERATOR_KEYS = set(PERMANENT_OPERATOR_CONFIG.keys())
 OPERATOR_KEY_ALIASES = {
-    "mts_premium": "mtssalon",
-    "mtspremium": "mtssalon",
-    "mega": "megafon",
-    "t2": "tele2",
-    "gaz": "gazprom",
+    "mtc": "mts", "mts_premium": "mtssalon", "mtspremium": "mtssalon", "mts_salon": "mtssalon",
+    "bilper": "bil", "bilsber": "bil", "bilsalon2": "bilsalon",
+    "mega": "megafon", "t2": "tele2", "tele2slaon": "tele2salon", "tele2_salon": "tele2salon",
+    "gaz": "gazprom", "dobro": "dobrosvyz", "dobrosvyaz": "dobrosvyz",
 }
 # =========================================================
 
@@ -1844,15 +1850,7 @@ def render_start(user_id: int) -> str:
     username = f"@{escape(user['username'])}" if user and user["username"] else "—"
     title = escape(db.get_setting("start_title", "ESIM Service X"))
     subtitle = escape(db.get_setting("start_subtitle", "Премиум сервис приёма номеров"))
-    description = db.get_setting("start_description", "🚀 <b>Быстрый приём заявок</b> • 💎 <b>Стабильные выплаты</b> • 🛡 <b>Контроль статусов</b>")
-    price_lines = [
-        f"{op_emoji_html(key)} <b>{escape(data['title'])}</b> — <b>{usd(get_mode_price(key, 'hold', user_id))}</b> / <b>{usd(get_mode_price(key, 'no_hold', user_id))}</b>"
-        for key, data in OPERATORS.items()
-    ]
-    queue_lines = [
-        f"{op_emoji_html(key)} <b>{escape(data['title'])}:</b> {count_waiting_mode(key, 'hold')} / {count_waiting_mode(key, 'no_hold')}"
-        for key, data in OPERATORS.items()
-    ]
+    description = db.get_setting("start_description", "🚀 <b>Быстрый приём заявок</b> • 💎 <b>Стабильные выплаты</b>")
     return (
         f"<b>💫 {title} 💫</b>\n"
         f"{subtitle}\n\n"
@@ -1860,12 +1858,8 @@ def render_start(user_id: int) -> str:
         f"🔗 <b>Username:</b> {username}\n"
         f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
         f"💰 <b>Баланс:</b> <b>{balance}</b>\n\n"
-        f"<b>💎 Прайсы:</b>\n"
-        + quote_block(price_lines)
-        + "\n\n<b>📤 Очереди:</b>\n"
-        + quote_block(queue_lines)
-        + "\n\n<b>Вы находитесь в главном меню.</b>\n👇 <b>Выберите нужное действие ниже:</b>"
-    )
+        f"👇 <b>Выберите нужное действие ниже:</b>"
+    )[:980]
 
 def render_profile(user_id: int) -> str:
     """Безопасный профиль: не падает, даже если в старой БД не хватает полей/операторов."""
@@ -2738,7 +2732,7 @@ def create_queue_item_ext(user_id: int, username: str, full_name: str, operator_
 def save_queue_operator_snapshot(item_id: int, operator_key: str):
     """Store operator metadata inside every queue item so DB can move to another bot."""
     try:
-        key = OPERATOR_KEY_ALIASES.get(str(operator_key or '').strip().lower(), str(operator_key or '').strip().lower())
+        key = normalize_operator_key(operator_key)
         op = OPERATORS.get(key, {})
         title = db.get_setting(f'operator_title_{key}', op.get('title', key.upper())) or op.get('title', key.upper())
         command = db.get_setting(f'operator_command_{key}', op.get('command', f'/{key}')) or op.get('command', f'/{key}')
@@ -2780,8 +2774,8 @@ def restore_operators_from_queue_history():
         """).fetchall()
         restored = []
         for r in rows:
-            key = OPERATOR_KEY_ALIASES.get(str(r['operator_key'] or '').strip().lower(), str(r['operator_key'] or '').strip().lower())
-            if not key:
+            key = normalize_operator_key(r['operator_key'])
+            if not key or key not in ACTIVE_OPERATOR_KEYS:
                 continue
             title = r['title'] or db.get_setting(f'operator_title_{key}', None) or OPERATORS.get(key, {}).get('title') or key.upper()
             command = r['command'] or db.get_setting(f'operator_command_{key}', None) or OPERATORS.get(key, {}).get('command') or f'/{key}'
@@ -2799,11 +2793,13 @@ def restore_operators_from_queue_history():
         logging.exception('restore_operators_from_queue_history failed')
 
 def get_mode_price(operator_key: str, mode: str, user_id: int | None = None) -> float:
+    operator_key = normalize_operator_key(operator_key)
     if user_id is not None:
         custom = db.get_user_price(user_id, operator_key, mode)
         if custom is not None:
             return float(custom)
-    legacy = db.get_setting(f"price_{operator_key}", str(OPERATORS[operator_key]['price']))
+    default_price = float(PERMANENT_OPERATOR_CONFIG.get(operator_key, OPERATORS.get(operator_key, {})).get('price', 0) or 0)
+    legacy = db.get_setting(f"price_{operator_key}", str(default_price))
     return float(db.get_setting(f"price_{mode}_{operator_key}", legacy))
 
 
@@ -3031,10 +3027,11 @@ async def send_queue_item_photo_to_chat(target_bot: Bot, chat_id: int, item, cap
                 pass
 
 def group_price_for_take(chat_id: int, thread_id: int | None, operator_key: str, mode: str) -> float:
+    operator_key = normalize_operator_key(operator_key)
     price = db.get_group_price(chat_id, thread_id, operator_key, mode)
     if price is not None:
         return float(price)
-    return float(get_mode_price(operator_key, mode, None))
+    return float(DEFAULT_GROUP_PRICES.get(operator_key, get_mode_price(operator_key, mode, None)))
 
 def render_group_finance(chat_id: int, thread_id: int | None) -> str:
     title_label = escape(workspace_display_title(chat_id, thread_id))
@@ -3264,34 +3261,48 @@ CUSTOM_OPERATOR_EMOJI = {
     "vtb": ("5427154326294376920", "🔵"),
     "gazprom": ("5280751174780199841", "🔷"),
     "miranda": ("", "🟣"),
+    "dobrosvyz": ("", "🟢"),
 }
+
+def normalize_operator_key(key: str | None) -> str:
+    raw = str(key or "").strip().lower()
+    return OPERATOR_KEY_ALIASES.get(raw, raw)
+
+
+def migrate_legacy_operator_keys():
+    """Старые/лишние ключи из перенесённых БД приводим к основным операторам."""
+    try:
+        for old, new in OPERATOR_KEY_ALIASES.items():
+            if old != new and new in ACTIVE_OPERATOR_KEYS:
+                db.conn.execute("UPDATE queue_items SET operator_key=? WHERE operator_key=?", (new, old))
+                db.conn.execute("UPDATE custom_operators SET is_deleted=1 WHERE key=?", (old,))
+        db.conn.commit()
+    except Exception:
+        logging.exception("migrate legacy operator keys failed")
 
 # Load operators after CUSTOM_OPERATOR_EMOJI exists.
 # ВАЖНО: база данных является источником сохранённых операторов/цен.
 
 def enforce_permanent_operators():
-    """Keep built-in operators available without wiping DB-saved values."""
+    """Keep only main operators in memory and keep submit prices stable."""
+    for old_key in list(OPERATORS.keys()):
+        if old_key not in ACTIVE_OPERATOR_KEYS:
+            OPERATORS.pop(old_key, None)
+            CUSTOM_OPERATOR_EMOJI.pop(old_key, None)
     for key, data in PERMANENT_OPERATOR_CONFIG.items():
-        title = db.get_setting(f"operator_title_{key}", data["title"]) or data["title"]
-        command = db.get_setting(f"operator_command_{key}", data["command"]) or data["command"]
-        price_raw = db.get_setting(f"price_{key}", None)
-        if price_raw is None:
-            price_raw = db.get_setting(f"price_hold_{key}", str(data["price"]))
-        try:
-            price = float(price_raw or data["price"])
-        except Exception:
-            price = float(data["price"])
+        title = data["title"]
+        command = data["command"]
+        price = float(data["price"])
         OPERATORS[key] = {"title": title, "price": price, "command": command}
-        if db.get_setting(f"operator_title_{key}", None) is None:
-            db.set_setting(f"operator_title_{key}", title)
-        if db.get_setting(f"operator_command_{key}", None) is None:
-            db.set_setting(f"operator_command_{key}", command)
-        if db.get_setting(f"price_{key}", None) is None:
-            db.set_setting(f"price_{key}", str(price))
-        if db.get_setting(f"price_hold_{key}", None) is None:
-            db.set_setting(f"price_hold_{key}", str(price))
-        if db.get_setting(f"price_no_hold_{key}", None) is None:
-            db.set_setting(f"price_no_hold_{key}", str(price))
+        db.set_setting(f"operator_title_{key}", title)
+        db.set_setting(f"operator_command_{key}", command)
+        db.set_setting(f"price_{key}", str(price))
+        db.set_setting(f"price_hold_{key}", str(price))
+        db.set_setting(f"price_no_hold_{key}", str(price))
+        if db.get_setting(f"operator_emoji_{key}", None) is None:
+            emoji_id, emoji = CUSTOM_OPERATOR_EMOJI.get(key, ("", "📱"))
+            db.set_setting(f"operator_emoji_id_{key}", emoji_id or "")
+            db.set_setting(f"operator_emoji_{key}", emoji or "📱")
     try:
         db.conn.commit()
     except Exception:
@@ -3299,48 +3310,45 @@ def enforce_permanent_operators():
 
 
 def seed_permanent_operators_to_db():
-    """Постоянные операторы должны быть и в памяти, и в БД.
-    Если база переезжает в другой бот — они всё равно поднимаются.
-    Сохранённые цены/названия не затираются.
-    """
+    """Постоянные основные операторы должны быть и в памяти, и в БД."""
     try:
+        migrate_legacy_operator_keys()
         for key, data in PERMANENT_OPERATOR_CONFIG.items():
-            title = db.get_setting(f"operator_title_{key}", data.get("title", key)) or data.get("title", key)
-            command = db.get_setting(f"operator_command_{key}", data.get("command", f"/{key}")) or data.get("command", f"/{key}")
-            raw_price = db.get_setting(f"price_{key}", db.get_setting(f"price_hold_{key}", db.get_setting(f"price_no_hold_{key}", str(data.get("price", 0)))))
-            try:
-                price = float(raw_price or data.get("price", 0) or 0)
-            except Exception:
-                price = float(data.get("price", 0) or 0)
+            title = data.get("title", key)
+            command = data.get("command", f"/{key}")
+            price = float(data.get("price", 0) or 0)
             emoji_id, emoji = CUSTOM_OPERATOR_EMOJI.get(key, (db.get_setting(f"operator_emoji_id_{key}", ""), db.get_setting(f"operator_emoji_{key}", "📱")))
             db.conn.execute("""
                 INSERT INTO custom_operators(key,title,price,command,emoji_id,emoji,is_deleted,updated_at)
                 VALUES(?,?,?,?,?,?,0,?)
                 ON CONFLICT(key) DO UPDATE SET
+                    title=excluded.title,
+                    price=excluded.price,
+                    command=excluded.command,
                     is_deleted=0,
                     updated_at=excluded.updated_at
             """, (key, title, price, command, emoji_id or "", emoji or "📱", now_str()))
-            if db.get_setting(f"operator_title_{key}", None) is None:
-                db.set_setting(f"operator_title_{key}", title)
-            if db.get_setting(f"operator_command_{key}", None) is None:
-                db.set_setting(f"operator_command_{key}", command)
-            if db.get_setting(f"price_{key}", None) is None:
-                db.set_setting(f"price_{key}", str(price))
-            if db.get_setting(f"price_hold_{key}", None) is None:
-                db.set_setting(f"price_hold_{key}", str(price))
-            if db.get_setting(f"price_no_hold_{key}", None) is None:
-                db.set_setting(f"price_no_hold_{key}", str(price))
+            db.set_setting(f"operator_title_{key}", title)
+            db.set_setting(f"operator_command_{key}", command)
+            db.set_setting(f"price_{key}", str(price))
+            db.set_setting(f"price_hold_{key}", str(price))
+            db.set_setting(f"price_no_hold_{key}", str(price))
             if db.get_setting(f"operator_emoji_id_{key}", None) is None:
                 db.set_setting(f"operator_emoji_id_{key}", emoji_id or "")
             if db.get_setting(f"operator_emoji_{key}", None) is None:
                 db.set_setting(f"operator_emoji_{key}", emoji or "📱")
             OPERATORS[key] = {"title": title, "price": price, "command": command}
             CUSTOM_OPERATOR_EMOJI[key] = (emoji_id or "", emoji or "📱")
+        for row in db.conn.execute("SELECT key FROM custom_operators").fetchall():
+            k = str(row['key'])
+            if normalize_operator_key(k) not in ACTIVE_OPERATOR_KEYS:
+                db.conn.execute("UPDATE custom_operators SET is_deleted=1 WHERE key=?", (k,))
+                OPERATORS.pop(k, None)
+                CUSTOM_OPERATOR_EMOJI.pop(k, None)
         db.conn.commit()
         logging.info("permanent operators seeded: %s", sorted(PERMANENT_OPERATOR_CONFIG.keys()))
     except Exception:
         logging.exception("seed permanent operators failed")
-
 
 
 def restore_operators_from_db_anywhere():
@@ -3365,8 +3373,8 @@ def restore_operators_from_db_anywhere():
                 if k2 not in ('hold', 'no_hold'):
                     keys.add(k2)
         for raw_key in sorted(keys):
-            key = OPERATOR_KEY_ALIASES.get(str(raw_key).strip().lower(), str(raw_key).strip().lower())
-            if not key or key in OPERATORS:
+            key = normalize_operator_key(raw_key)
+            if not key or key not in ACTIVE_OPERATOR_KEYS or key in OPERATORS:
                 continue
             title = db.get_setting(f'operator_title_{key}', key.upper())
             command = db.get_setting(f'operator_command_{key}', f'/{key}')
@@ -3384,6 +3392,7 @@ def restore_operators_from_db_anywhere():
 
 
 restore_operators_from_db_anywhere()
+enforce_permanent_operators()
 logging.info("operators loaded final: %s", sorted(OPERATORS.keys()))
 
 def op_emoji_html(operator_key: str) -> str:
@@ -3469,7 +3478,7 @@ async def send_banner_message(entity, banner_path: str, caption: str, reply_mark
     if Path(banner_path).exists():
         # HTML нельзя резать посередине: Telegram ломает <blockquote>.
         # Большой текст отправляем отдельно от баннера, полностью сохраняя HTML.
-        if len(caption) <= 900:
+        if len(caption) <= 1024:
             try:
                 if hasattr(entity, 'answer_photo'):
                     return await entity.answer_photo(FSInputFile(banner_path), caption=caption, reply_markup=reply_markup)
@@ -4100,6 +4109,7 @@ async def submit_qr(message: Message, state: FSMContext):
         qr_mime,
         qr_filename,
     )
+    save_queue_operator_snapshot(item_id, operator_key)
     await state.update_data(operator_key=operator_key, mode=mode)
     await send_log(
         message.bot,
@@ -5251,7 +5261,7 @@ async def send_next_item_for_operator(message: Message, operator_key: str):
         raise
 
 
-@router.message(Command("mts", "mtc", "mtspremium", "mtssalon", "bil", "bilsalon", "mega", "megafon", "t2", "tele2", "tele2salon", "sber", "vtb", "gaz", "gazprom", "miranda"))
+@router.message(Command("mts", "mtc", "mtspremium", "mtssalon", "bil", "bilsalon", "mega", "megafon", "t2", "tele2", "tele2salon", "sber", "vtb", "gaz", "gazprom", "miranda", "dobro", "dobrosvyz"))
 async def legacy_take_commands(message: Message):
     if not is_operator_or_admin(message.from_user.id):
         return
@@ -5595,6 +5605,7 @@ async def submit_qr(message: Message, state: FSMContext):
         qr_mime,
         qr_filename,
     )
+    save_queue_operator_snapshot(item_id, operator_key)
     await state.update_data(operator_key=operator_key, mode=mode)
     await send_log(
         message.bot,
@@ -6708,7 +6719,7 @@ async def send_next_item_for_operator(message: Message, operator_key: str):
         raise
 
 
-@router.message(Command("mts", "mtc", "mtspremium", "mtssalon", "bil", "bilsalon", "mega", "megafon", "t2", "tele2", "tele2salon", "sber", "vtb", "gaz", "gazprom", "miranda"))
+@router.message(Command("mts", "mtc", "mtspremium", "mtssalon", "bil", "bilsalon", "mega", "megafon", "t2", "tele2", "tele2salon", "sber", "vtb", "gaz", "gazprom", "miranda", "dobro", "dobrosvyz"))
 async def legacy_take_commands(message: Message):
     if not is_operator_or_admin(message.from_user.id):
         return
@@ -8198,6 +8209,11 @@ async def main():
     try:
         me = await primary_bot.get_me()
         db.set_setting('bot_username_cached', me.username or BOT_USERNAME_FALLBACK)
+        try:
+            await primary_bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+            logging.info("Bot menu button reset to default commands")
+        except Exception:
+            logging.exception("reset bot menu button failed")
         logging.info("Primary bot started as @%s", me.username or BOT_USERNAME_FALLBACK)
         logging.info("Anti-crash recovery complete; holds and queue state restored")
     except Exception:
