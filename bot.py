@@ -3517,7 +3517,7 @@ def resolve_operator_input(raw: str) -> str | None:
     return None
 
 
-def operator_delete_keyboard() -> InlineKeyboardMarkup:
+def operator_delete_keyboard():
     kb = InlineKeyboardBuilder()
     for key in list(OPERATORS.keys()):
         if not is_operator_visible(key):
