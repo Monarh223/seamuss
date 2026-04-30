@@ -1845,76 +1845,53 @@ def referral_kb(user_id: int):
 
 
 def render_start(user_id: int) -> str:
-    """Главное меню: полный текст + прайсы и очереди в одной плашке.
+    """Главное меню: красивый текст как был + прайсы/очереди в одной плашке.
 
-    Telegram caption имеет лимит 1024 символа. Чтобы /start снова уходил
-    одним сообщением (фото + текст + кнопки), здесь используем лёгкий текст
-    без тяжёлой HTML-разметки и держим прайсы/очереди компактно.
+    Важно: не режем текст криво и не превращаем оформление в простыню.
+    Если caption Telegram вдруг превысит лимит, send_banner_message сам отправит
+    баннер отдельно и полный текст отдельным сообщением, без порчи HTML.
     """
     user = db.get_user(user_id)
     balance = usd(float(user["balance"] if user else 0))
     username = f"@{escape(user['username'])}" if user and user["username"] else "—"
-    title = _strip_html_tags(db.get_setting("start_title", "ESIM Service X"))
-    subtitle = _strip_html_tags(db.get_setting("start_subtitle", "Премиум сервис приёма номеров"))
-    description = _strip_html_tags(db.get_setting(
+
+    title = db.get_setting("start_title", "ESIM Service X")
+    subtitle = db.get_setting("start_subtitle", "Премиум сервис приёма номеров")
+    description = db.get_setting(
         "start_description",
-        "🚀 Быстрый приём заявок • 💎 Стабильные выплаты • 🛡 Контроль статусов"
-    ))
+        "🚀 <b>Быстрый приём заявок</b> • 💎 <b>Стабильные выплаты</b> • 🛡 <b>Контроль статусов</b>"
+    )
 
-    lines = [
-        f"💫 {title} 💫",
-        subtitle,
-        "",
-        description,
-        "",
-        f"🔗 Username: {username}",
-        f"🆔 ID: {user_id}",
-        f"💰 Баланс: {balance}",
-        "",
-        "💎 Прайсы и очереди:",
-    ]
-
-    # Только основные операторы, без восстановленных мусорных ключей из старых БД.
+    price_lines: list[str] = []
     for key in OPERATORS.keys():
         if key not in PERMANENT_OPERATOR_KEYS:
             continue
         data = OPERATORS.get(key, {})
-        emoji = (CUSTOM_OPERATOR_EMOJI.get(key, ("", "📞"))[1] or "📞").strip()
-        title_op = _strip_html_tags(str(data.get("title", key)))
+        emoji = op_emoji_html(key)
+        title_op = escape(str(data.get("title", key)))
         hold_price = usd(get_mode_price(key, "hold", user_id))
         no_hold_price = usd(get_mode_price(key, "no_hold", user_id))
         q_hold = count_waiting_mode(key, "hold")
         q_no_hold = count_waiting_mode(key, "no_hold")
-        lines.append(f"{emoji} {title_op} — {hold_price} / {no_hold_price}")
-        lines.append(f"Очередь: {q_hold}/{q_no_hold}")
+        # Очередь не отдельной строкой под каждым оператором, а компактно в той же плашке.
+        price_lines.append(
+            f"{emoji} <b>{title_op}</b> — <b>{hold_price} / {no_hold_price}</b>  ·  <i>Очередь: {q_hold}/{q_no_hold}</i>"
+        )
 
-    lines.extend([
-        "",
-        "Вы находитесь в главном меню.",
-        "👇 Выберите нужное действие ниже:",
-    ])
+    prices_block = "\n".join(price_lines) if price_lines else "Прайсы пока не настроены."
 
-    text = "\n".join(lines).strip()
-    if len(text) > 1024:
-        # Если админ в настройках поставил слишком длинный заголовок/описание,
-        # сокращаем только описание, не убирая прайсы и очереди.
-        lines[3] = "🚀 Быстрый приём заявок • 💎 Стабильные выплаты • 🛡 Контроль статусов"
-        text = "\n".join(lines).strip()
-    if len(text) > 1024:
-        # Последняя страховка: очередь и прайсы остаются в той же плашке, но в 1 строку.
-        compact = lines[:10]
-        for key in OPERATORS.keys():
-            if key not in PERMANENT_OPERATOR_KEYS:
-                continue
-            data = OPERATORS.get(key, {})
-            emoji = (CUSTOM_OPERATOR_EMOJI.get(key, ("", "📞"))[1] or "📞").strip()
-            title_op = _strip_html_tags(str(data.get("title", key)))
-            compact.append(
-                f"{emoji} {title_op} — {usd(get_mode_price(key, 'hold', user_id))}/{usd(get_mode_price(key, 'no_hold', user_id))} • Оч: {count_waiting_mode(key, 'hold')}/{count_waiting_mode(key, 'no_hold')}"
-            )
-        compact.extend(["", "Вы находитесь в главном меню.", "👇 Выберите нужное действие ниже:"])
-        text = "\n".join(compact).strip()[:1024]
-    return text
+    return _html_balance_patch(
+        f"💫 <b>{escape(title)}</b> 💫\n"
+        f"{escape(_strip_html_tags(subtitle))}\n\n"
+        f"{description}\n\n"
+        f"🔗 <b>Username:</b> {username}\n"
+        f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
+        f"💰 <b>Баланс:</b> <b>{balance}</b>\n\n"
+        f"💎 <b>Прайсы и очереди:</b>\n"
+        f"<blockquote>{prices_block}</blockquote>\n\n"
+        f"<b>Вы находитесь в главном меню.</b>\n"
+        f"👇 <b>Выберите нужное действие ниже:</b>"
+    )
 
 def render_profile(user_id: int) -> str:
     """Безопасный профиль: не падает, даже если в старой БД не хватает полей/операторов."""
