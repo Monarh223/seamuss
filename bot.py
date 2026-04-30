@@ -136,7 +136,7 @@ def is_operator_hidden_setting(operator_key: str) -> bool:
 
 def is_operator_visible(operator_key: str) -> bool:
     key = normalize_operator_key(operator_key)
-    if key not in OPERATORS:
+    if not key or key not in OPERATORS:
         return False
     if key not in ACTIVE_OPERATOR_KEYS:
         return False
@@ -3477,6 +3477,55 @@ enforce_permanent_operators()
 logging.info("operators loaded final: %s", sorted(OPERATORS.keys()))
 
 
+
+def resolve_operator_input(raw: str) -> str | None:
+    """Resolve operator by key, title, or text like 'tele2 — Tele2 Салон'."""
+    s = (raw or "").strip()
+    if not s:
+        return None
+    s = s.replace("—", "-").replace("–", "-").strip()
+    # remove common bullets/emoji prefixes
+    s_clean = re.sub(r"^[^\wа-яА-ЯёЁ]+", "", s, flags=re.I).strip()
+    candidates = []
+    candidates.append(s_clean)
+    if "-" in s_clean:
+        candidates.append(s_clean.split("-", 1)[0].strip())
+        candidates.append(s_clean.split("-", 1)[1].strip())
+    if "|" in s_clean:
+        candidates.append(s_clean.split("|", 1)[0].strip())
+        candidates.append(s_clean.split("|", 1)[1].strip())
+
+    # exact key / alias
+    for c in candidates:
+        key = normalize_operator_key(c.lower().lstrip("/"))
+        if key in OPERATORS:
+            return key
+
+    # exact title
+    low_candidates = [c.casefold() for c in candidates if c]
+    for key, data in OPERATORS.items():
+        title = str((data or {}).get("title", "")).strip()
+        if title and title.casefold() in low_candidates:
+            return key
+
+    # substring title
+    raw_low = s_clean.casefold()
+    for key, data in OPERATORS.items():
+        title = str((data or {}).get("title", "")).strip()
+        if title and (raw_low == title.casefold() or title.casefold() in raw_low or raw_low in title.casefold()):
+            return key
+    return None
+
+
+def operator_delete_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for key in list(OPERATORS.keys()):
+        if not is_operator_visible(key):
+            continue
+        kb.row(make_operator_button(key, callback_data=f"admin:operator_delete:{key}", prefix_mark="🗑 "))
+    kb.row(InlineKeyboardButton(text="↩️ Назад", callback_data="admin:operators"))
+    return kb.as_markup()
+
 def hide_operator_everywhere(operator_key: str):
     """Hide/delete any operator, including built-in permanent operators.
 
@@ -3800,6 +3849,27 @@ async def delete_crypto_check(check_id: int) -> tuple[bool, str]:
     except Exception as e:
         return False, f"Ошибка удаления чека: {e}"
 
+
+
+@router.callback_query(F.data.startswith("admin:operator_delete:"))
+async def delete_operator_button(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await safe_callback_answer(callback, "Нет доступа")
+        return
+    await safe_callback_answer(callback)
+    key = normalize_operator_key(callback.data.split(":", 2)[2])
+    if not key or key not in OPERATORS:
+        await callback.message.answer("❌ Оператор не найден.", reply_markup=operator_delete_keyboard())
+        return
+    title = op_title(key)
+    hide_operator_everywhere(key)
+    logging.info("operator hidden/deleted by admin button key=%s title=%s admin_id=%s", key, title, callback.from_user.id)
+    await callback.message.answer(
+        f"✅ Оператор удалён/скрыт: <b>{escape(title)}</b>\\n"
+        f"key: <code>{escape(key)}</code>\\n\\n"
+        "История заявок и старые номера не удалены.",
+        reply_markup=operator_delete_keyboard()
+    )
 
 @router.message(CommandStart())
 async def start_cmd(message: Message, state: FSMContext):
@@ -4798,7 +4868,7 @@ async def admin_pick_operator_emoji(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
     key = callback.data.split(":", 2)[-1].strip().lower()
-    if key not in OPERATORS:
+    if not key or key not in OPERATORS:
         await callback.answer("Оператор не найден", show_alert=True)
         return
     current_emoji_id, current_fallback = CUSTOM_OPERATOR_EMOJI.get(key, ("", "📱"))
@@ -4849,8 +4919,8 @@ async def admin_remove_operator(callback: CallbackQuery, state: FSMContext):
         "<b>➖ Удаление оператора</b>\n\n"
         "Отправьте <code>key</code> оператора, которого нужно удалить.\n\n"
         f"{removable_text}\n\n"
-        "Базовых операторов удалить нельзя."
-    )
+        "Можно удалить любого оператора, включая базового. История номеров не удаляется."
+    , reply_markup=operator_delete_keyboard())
     await safe_callback_answer(callback)
 
 @router.callback_query(F.data == "admin:set_hold")
@@ -5044,7 +5114,7 @@ async def admin_remove_operator_value(message: Message, state: FSMContext):
     if key in base_keys:
         await message.answer("Базового оператора удалить нельзя.")
         return
-    if key not in OPERATORS:
+    if not key or key not in OPERATORS:
         await message.answer("Оператор не найден.")
         return
     extra_items = load_extra_operator_items()
@@ -6305,8 +6375,8 @@ async def admin_remove_operator(callback: CallbackQuery, state: FSMContext):
         "<b>➖ Удаление оператора</b>\n\n"
         "Отправьте <code>key</code> оператора, которого нужно удалить.\n\n"
         f"{removable_text}\n\n"
-        "Базовых операторов удалить нельзя."
-    )
+        "Можно удалить любого оператора, включая базового. История номеров не удаляется."
+    , reply_markup=operator_delete_keyboard())
     await safe_callback_answer(callback)
 
 @router.callback_query(F.data == "admin:set_hold")
@@ -6502,7 +6572,7 @@ async def admin_remove_operator_value(message: Message, state: FSMContext):
     if key in base_keys:
         await message.answer("Базового оператора удалить нельзя.")
         return
-    if key not in OPERATORS:
+    if not key or key not in OPERATORS:
         await message.answer("Оператор не найден.")
         return
     extra_items = load_extra_operator_items()
