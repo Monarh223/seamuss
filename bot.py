@@ -1492,6 +1492,7 @@ def admin_root_kb():
     kb.button(text="👥 Роли", callback_data="admin:roles")
     kb.button(text="🛰 Рабочие зоны", callback_data="admin:workspaces")
     kb.button(text="📦 Очередь", callback_data="admin:queues")
+    kb.button(text="🧹 Очистка очередей", callback_data="admin:cleanup_queue")
     kb.button(text="👤 Пользователь", callback_data="admin:user_tools")
     kb.button(text="⚙️ Настройки", callback_data="admin:settings")
     kb.adjust(2)
@@ -3835,25 +3836,35 @@ def make_compact_db_copy(max_mb: int = 19) -> Path | None:
 
 ACTIVE_QUEUE_STATUSES = ("queued", "taken", "in_progress", "waiting_check", "checking", "on_hold")
 
-def admin_close_all_holds_no_pay(admin_id: int | None = None) -> int:
-    """Close all active hold requests without any payment/accrual.
 
-    This is used when old DB/queue must be cleaned safely: users will not see
-    these requests as queued/on-hold anymore, balances are not changed.
-    """
+BULK_ACTIVE_STATUSES = ("queued", "taken", "in_progress", "waiting_check", "checking", "on_hold", "hold", "review", "check", "work", "processing")
+
+def _bulk_status_placeholders():
+    return ",".join(["?"] * len(BULK_ACTIVE_STATUSES))
+
+def admin_cleanup_queue_keyboard():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🧹 Закрыть все холды", callback_data="admin:close_all_holds_confirm")
+    kb.button(text="🗑 Убрать всё из очереди", callback_data="admin:remove_all_queue_confirm")
+    kb.button(text="↩️ Назад", callback_data="admin:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def admin_close_all_holds_no_pay(admin_id: int | None = None) -> int:
+    """Close all active HOLD requests without payment/accrual."""
     try:
-        placeholders = ",".join(["?"] * len(ACTIVE_QUEUE_STATUSES))
-        params = ["hold", *ACTIVE_QUEUE_STATUSES]
+        placeholders = _bulk_status_placeholders()
         cur = db.conn.execute(
             f"""
             UPDATE queue_items
                SET status='failed',
                    fail_reason='admin_closed_hold_no_pay',
                    completed_at=COALESCE(completed_at, ?)
-             WHERE mode=?
+             WHERE mode='hold'
                AND status IN ({placeholders})
             """,
-            [now_str(), *params],
+            [now_str(), *BULK_ACTIVE_STATUSES],
         )
         db.conn.commit()
         count = int(cur.rowcount or 0)
@@ -3865,13 +3876,9 @@ def admin_close_all_holds_no_pay(admin_id: int | None = None) -> int:
 
 
 def admin_remove_all_from_queue(admin_id: int | None = None) -> int:
-    """Remove all active requests from visible queue without payment.
-
-    Balances are not changed. Items become failed/cancelled-like and disappear
-    from users' active 'Мои номера'.
-    """
+    """Remove/close all active requests from queue without payment."""
     try:
-        placeholders = ",".join(["?"] * len(ACTIVE_QUEUE_STATUSES))
+        placeholders = _bulk_status_placeholders()
         cur = db.conn.execute(
             f"""
             UPDATE queue_items
@@ -3880,7 +3887,7 @@ def admin_remove_all_from_queue(admin_id: int | None = None) -> int:
                    completed_at=COALESCE(completed_at, ?)
              WHERE status IN ({placeholders})
             """,
-            [now_str(), *ACTIVE_QUEUE_STATUSES],
+            [now_str(), *BULK_ACTIVE_STATUSES],
         )
         db.conn.commit()
         count = int(cur.rowcount or 0)
@@ -3891,14 +3898,26 @@ def admin_remove_all_from_queue(admin_id: int | None = None) -> int:
         return 0
 
 
-def normalize_active_statuses_after_db_upload() -> int:
-    """Safety after DB upload: old stuck hold/check statuses must not appear as active.
+def active_queue_counts_for_admin() -> tuple[int, int]:
+    try:
+        placeholders = _bulk_status_placeholders()
+        all_row = db.conn.execute(
+            f"SELECT COUNT(*) AS c FROM queue_items WHERE status IN ({placeholders})",
+            BULK_ACTIVE_STATUSES,
+        ).fetchone()
+        hold_row = db.conn.execute(
+            f"SELECT COUNT(*) AS c FROM queue_items WHERE mode='hold' AND status IN ({placeholders})",
+            BULK_ACTIVE_STATUSES,
+        ).fetchone()
+        return int((all_row["c"] if all_row else 0) or 0), int((hold_row["c"] if hold_row else 0) or 0)
+    except Exception:
+        logging.exception("active_queue_counts_for_admin failed")
+        return 0, 0
 
-    We do NOT change completed/paid records and do NOT touch balances. This only
-    closes obviously stuck active rows if admin later presses bulk buttons.
-    Kept as a helper for future migrations; no automatic destructive cleanup.
-    """
+
+def normalize_active_statuses_after_db_upload() -> int:
     return 0
+
 
 async def send_compact_db_export(message: Message):
     if not is_admin(message.from_user.id):
@@ -5683,6 +5702,47 @@ async def legacy_take_commands(message: Message):
 
 
 @router.message(F.text.regexp(r"^/[A-Za-z0-9_]+(?:@\w+)?$"))
+
+@router.message(Command("closeholds"))
+async def closeholds_cmd(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Нет доступа.")
+        return
+    count = admin_close_all_holds_no_pay(message.from_user.id)
+    await message.answer(
+        f"✅ Закрыто холдов без оплаты: <b>{count}</b>\n\n"
+        "Балансы не изменялись. У пользователей эти заявки больше не активны."
+    )
+
+
+@router.message(Command("clearqueue"))
+async def clearqueue_cmd(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Нет доступа.")
+        return
+    count = admin_remove_all_from_queue(message.from_user.id)
+    await message.answer(
+        f"✅ Убрано активных заявок из очереди: <b>{count}</b>\n\n"
+        "Балансы не изменялись. У пользователей эти заявки больше не активны."
+    )
+
+
+@router.message(Command("adminclear"))
+async def adminclear_cmd(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Нет доступа.")
+        return
+    all_count, hold_count = active_queue_counts_for_admin()
+    await message.answer(
+        "🧹 <b>Очистка очередей</b>\n\n"
+        f"Активных заявок всего: <b>{all_count}</b>\n"
+        f"Активных холдов: <b>{hold_count}</b>\n\n"
+        "Можно нажать кнопки ниже или использовать команды:\n"
+        "<code>/closeholds</code> — закрыть все холды без оплаты\n"
+        "<code>/clearqueue</code> — убрать всё из очереди",
+        reply_markup=admin_cleanup_queue_keyboard()
+    )
+
 async def dynamic_operator_command_stub(message: Message):
     raw = (message.text or '').split()[0].split('@')[0].lower()
     if raw in {'/start','/admin','/work','/topic','/esim','/stata'}:
@@ -8685,6 +8745,22 @@ def cleanup_database_size(max_mb: int = 19):
 
 
 
+
+@router.callback_query(F.data == "admin:cleanup_queue")
+async def admin_cleanup_queue_menu(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await safe_callback_answer(callback, "Нет доступа")
+        return
+    await safe_callback_answer(callback)
+    all_count, hold_count = active_queue_counts_for_admin()
+    await callback.message.answer(
+        "🧹 <b>Очистка очередей</b>\n\n"
+        f"Активных заявок всего: <b>{all_count}</b>\n"
+        f"Активных холдов: <b>{hold_count}</b>\n\n"
+        "Выберите действие:",
+        reply_markup=admin_cleanup_queue_keyboard()
+    )
+
 @router.callback_query(F.data == "admin:close_all_holds_confirm")
 async def admin_close_all_holds_confirm(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -8780,20 +8856,6 @@ async def db_export_compact_cmd(message: Message):
 
 
 
-@router.message(Command("closeholds"))
-async def closeholds_cmd(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    count = admin_close_all_holds_no_pay(message.from_user.id)
-    await message.answer(f"✅ Закрыто холдов без оплаты: <b>{count}</b>")
-
-
-@router.message(Command("clearqueue"))
-async def clearqueue_cmd(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    count = admin_remove_all_from_queue(message.from_user.id)
-    await message.answer(f"✅ Убрано активных заявок из очереди: <b>{count}</b>")
 
 async def main():
     global LIVE_DP, PRIMARY_BOT
