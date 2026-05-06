@@ -1097,7 +1097,35 @@ def is_operator_or_admin(user_id: int) -> bool:
     return user_role(user_id) in {"chief_admin", "admin", "operator"}
 
 
+
+async def callback_actor_can_take_esim(callback: CallbackQuery) -> tuple[bool, str]:
+    msg = getattr(callback, "message", None)
+    user = getattr(callback, "from_user", None)
+    if not msg or not user:
+        return False, "no_message_or_user"
+    role = user_role(user.id)
+    if role in {"chief_admin", "admin", "operator"}:
+        return True, f"internal_role:{role}"
+    if msg.chat.type == ChatType.PRIVATE:
+        return False, f"internal_role:{role or 'none'}"
+    try:
+        member = await callback.bot.get_chat_member(msg.chat.id, user.id)
+        status = str(getattr(member, "status", "unknown"))
+        if status in {"creator", "administrator", "member", "restricted"}:
+            return True, f"chat_member:{status}"
+        return False, f"chat_member:{status}"
+    except Exception:
+        logging.exception("callback_actor_can_take_esim get_chat_member failed chat_id=%s user_id=%s; allow until workspace check", msg.chat.id, user.id)
+        return True, "group_user_check_failed"
+
+
 async def message_actor_can_take_esim(message: Message) -> tuple[bool, str]:
+    """Who may open /esim.
+
+    In work groups /esim must be available to regular group members too,
+    because the real protection is the /work or /topic workspace check below.
+    Private chats stay blocked.
+    """
     user = getattr(message, "from_user", None)
     if not user:
         return False, "no_user"
@@ -1108,13 +1136,17 @@ async def message_actor_can_take_esim(message: Message) -> tuple[bool, str]:
         return False, f"internal_role:{role or 'none'}"
     try:
         member = await message.bot.get_chat_member(message.chat.id, user.id)
-        status = getattr(member, "status", "unknown")
+        status = str(getattr(member, "status", "unknown"))
         if status in {"creator", "administrator"}:
             return True, f"chat_admin:{status}"
+        if status in {"member", "restricted"}:
+            return True, f"chat_member:{status}"
         return False, f"chat_member:{status}"
     except Exception:
-        logging.exception("message_actor_can_take_esim failed chat_id=%s user_id=%s", message.chat.id, user.id)
-        return False, f"internal_role:{role or 'none'}"
+        # If Telegram member check fails, still allow in non-private chat.
+        # Workspace check after this will block non-working chats.
+        logging.exception("message_actor_can_take_esim get_chat_member failed chat_id=%s user_id=%s; allow until workspace check", message.chat.id, user.id)
+        return True, f"group_user_check_failed"
 
 
 def is_chief_admin(user_id: int) -> bool:
@@ -4388,7 +4420,8 @@ def esim_kb():
 
 @router.callback_query(F.data.startswith("takeop:"))
 async def takeop_callback(callback: CallbackQuery):
-    if not is_operator_or_admin(callback.from_user.id):
+    if callback.message.chat.type == ChatType.PRIVATE and not is_operator_or_admin(callback.from_user.id):
+        await safe_callback_answer(callback, "⛔ Нет доступа", show_alert=True)
         return
     operator_key = callback.data.split(":", 1)[1]
     if operator_key not in OPERATORS:
@@ -5844,7 +5877,7 @@ async def esim_command(message: Message):
     logging.info("/esim actor check chat_id=%s user_id=%s allowed=%s reason=%s", message.chat.id, getattr(message.from_user, "id", None), allowed_actor, actor_reason)
     if not allowed_actor:
         logging.warning("/esim denied chat_id=%s message_id=%s user_id=%s reason=%s", message.chat.id, message.message_id, getattr(message.from_user, "id", None), actor_reason)
-        await message.answer("Использовать /esim могут только операторы, админы бота или админы этой группы.")
+        await message.answer("⛔ Нет доступа.")
         return
     if message.chat.type == ChatType.PRIVATE:
         await message.answer("Команда работает только в рабочей группе или топике.")
@@ -7302,7 +7335,7 @@ async def esim_command(message: Message):
     logging.info("/esim actor check chat_id=%s user_id=%s allowed=%s reason=%s", message.chat.id, getattr(message.from_user, "id", None), allowed_actor, actor_reason)
     if not allowed_actor:
         logging.warning("/esim denied chat_id=%s message_id=%s user_id=%s reason=%s", message.chat.id, message.message_id, getattr(message.from_user, "id", None), actor_reason)
-        await message.answer("Использовать /esim могут только операторы, админы бота или админы этой группы.")
+        await message.answer("⛔ Нет доступа.")
         return
     if message.chat.type == ChatType.PRIVATE:
         await message.answer("Команда работает только в рабочей группе или топике.")
@@ -7323,7 +7356,10 @@ async def esim_back_mode(callback: CallbackQuery):
     if not consume_event_once("cb_esim_back", callback.id):
         await safe_callback_answer(callback)
         return
-    if not is_operator_or_admin(callback.from_user.id):
+    allowed_actor, actor_reason = await callback_actor_can_take_esim(callback)
+    logging.info("%s actor check chat_id=%s user_id=%s allowed=%s reason=%s", callback.data, callback.message.chat.id, callback.from_user.id, allowed_actor, actor_reason)
+    if not allowed_actor:
+        await safe_callback_answer(callback, "⛔ Нет доступа", show_alert=True)
         return
     text = "<b>📥 Выбор номера ESIM</b>\n\nСначала выберите режим, который нужен:"
     await safe_edit_or_send(callback, text, reply_markup=esim_mode_kb(callback.from_user.id))
@@ -7336,7 +7372,10 @@ async def esim_choose_mode(callback: CallbackQuery):
     if not consume_event_once("cb_esim_mode", callback.id):
         await safe_callback_answer(callback)
         return
-    if not is_operator_or_admin(callback.from_user.id):
+    allowed_actor, actor_reason = await callback_actor_can_take_esim(callback)
+    logging.info("%s actor check chat_id=%s user_id=%s allowed=%s reason=%s", callback.data, callback.message.chat.id, callback.from_user.id, allowed_actor, actor_reason)
+    if not allowed_actor:
+        await safe_callback_answer(callback, "⛔ Нет доступа", show_alert=True)
         return
     mode = callback.data.split(':', 1)[1]
     text = f"<b>📥 Выбор номера ESIM</b>\n\nВыбран режим: <b>{mode_label(mode)}</b>\n👇 Теперь выберите оператора:\n<i>Цена указана прямо в кнопках.</i>"
@@ -7351,7 +7390,10 @@ async def esim_take(callback: CallbackQuery):
     if not consume_event_once("cb_esim_take", callback.id):
         await safe_callback_answer(callback)
         return
-    if not is_operator_or_admin(callback.from_user.id):
+    allowed_actor, actor_reason = await callback_actor_can_take_esim(callback)
+    logging.info("%s actor check chat_id=%s user_id=%s allowed=%s reason=%s", callback.data, callback.message.chat.id, callback.from_user.id, allowed_actor, actor_reason)
+    if not allowed_actor:
+        await safe_callback_answer(callback, "⛔ Нет доступа", show_alert=True)
         return
     _, operator_key, mode = callback.data.split(':')
     thread_id = getattr(callback.message, 'message_thread_id', None)
@@ -7845,7 +7887,10 @@ async def myremove_cb(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("take_start:"))
 async def take_start_cb(callback: CallbackQuery):
-    if not is_operator_or_admin(callback.from_user.id):
+    allowed_actor, actor_reason = await callback_actor_can_take_esim(callback)
+    logging.info("%s actor check chat_id=%s user_id=%s allowed=%s reason=%s", callback.data, callback.message.chat.id, callback.from_user.id, allowed_actor, actor_reason)
+    if not allowed_actor:
+        await safe_callback_answer(callback, "⛔ Нет доступа", show_alert=True)
         return
     item_id = int(callback.data.split(":")[-1])
     item = db.get_queue_item(item_id)
@@ -7886,7 +7931,10 @@ async def take_start_cb(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("error_pre:"))
 async def error_pre_cb(callback: CallbackQuery):
-    if not is_operator_or_admin(callback.from_user.id):
+    allowed_actor, actor_reason = await callback_actor_can_take_esim(callback)
+    logging.info("%s actor check chat_id=%s user_id=%s allowed=%s reason=%s", callback.data, callback.message.chat.id, callback.from_user.id, allowed_actor, actor_reason)
+    if not allowed_actor:
+        await safe_callback_answer(callback, "⛔ Нет доступа", show_alert=True)
         return
     item_id = int(callback.data.split(":")[-1])
     item = db.get_queue_item(item_id)
@@ -7918,7 +7966,10 @@ async def error_pre_cb(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("instant_pay:"))
 async def instant_pay_cb(callback: CallbackQuery):
-    if not is_operator_or_admin(callback.from_user.id):
+    allowed_actor, actor_reason = await callback_actor_can_take_esim(callback)
+    logging.info("%s actor check chat_id=%s user_id=%s allowed=%s reason=%s", callback.data, callback.message.chat.id, callback.from_user.id, allowed_actor, actor_reason)
+    if not allowed_actor:
+        await safe_callback_answer(callback, "⛔ Нет доступа", show_alert=True)
         return
     item_id = int(callback.data.split(":")[-1])
     item = db.get_queue_item(item_id)
@@ -7959,7 +8010,10 @@ async def instant_pay_cb(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("slip:"))
 async def slip_cb(callback: CallbackQuery):
-    if not is_operator_or_admin(callback.from_user.id):
+    allowed_actor, actor_reason = await callback_actor_can_take_esim(callback)
+    logging.info("%s actor check chat_id=%s user_id=%s allowed=%s reason=%s", callback.data, callback.message.chat.id, callback.from_user.id, allowed_actor, actor_reason)
+    if not allowed_actor:
+        await safe_callback_answer(callback, "⛔ Нет доступа", show_alert=True)
         return
     item_id = int(callback.data.split(":")[-1])
     item = db.get_queue_item(item_id)
