@@ -5736,107 +5736,8 @@ async def legacy_take_commands(message: Message):
 
 @router.message(F.text.regexp(r"^/[A-Za-z0-9_]+(?:@\w+)?$"))
 
-@router.message(Command("closeholds"))
-async def closeholds_cmd(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("⛔ Нет доступа.")
-        return
-    count = admin_close_all_holds_no_pay(message.from_user.id)
-    await message.answer(
-        f"✅ Закрыто холдов без оплаты: <b>{count}</b>\n\n"
-        "Балансы не изменялись. У пользователей эти заявки больше не активны."
-    )
 
 
-@router.message(Command("clearqueue"))
-async def clearqueue_cmd(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("⛔ Нет доступа.")
-        return
-    count = admin_remove_all_from_queue(message.from_user.id)
-    await message.answer(
-        f"✅ Убрано активных заявок из очереди: <b>{count}</b>\n\n"
-        "Балансы не изменялись. У пользователей эти заявки больше не активны."
-    )
-
-
-@router.message(Command("adminclear"))
-async def adminclear_cmd(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("⛔ Нет доступа.")
-        return
-    all_count, hold_count = active_queue_counts_for_admin()
-    await message.answer(
-        "🧹 <b>Очистка очередей</b>\n\n"
-        f"Активных заявок всего: <b>{all_count}</b>\n"
-        f"Активных холдов: <b>{hold_count}</b>\n\n"
-        "Можно нажать кнопки ниже или использовать команды:\n"
-        "<code>/closeholds</code> — закрыть все холды без оплаты\n"
-        "<code>/clearqueue</code> — убрать всё из очереди",
-        reply_markup=admin_cleanup_queue_keyboard()
-    )
-
-async def dynamic_operator_command_stub(message: Message):
-    raw = (message.text or '').split()[0].split('@')[0].lower()
-    if raw in {'/start','/admin','/work','/topic','/esim','/stata'}:
-        logging.info("dynamic_operator_command_stub skip raw=%s chat_id=%s user_id=%s", raw, message.chat.id, getattr(message.from_user, 'id', None))
-        raise SkipHandler()
-    if not message.from_user or not is_operator_or_admin(message.from_user.id):
-        raise SkipHandler()
-    if raw in operator_command_map():
-        logging.info("dynamic_operator_command_stub handled raw=%s chat_id=%s user_id=%s", raw, message.chat.id, message.from_user.id)
-        await message.answer("Команды операторов отключены. Используй <b>/esim</b>.")
-        return
-    raise SkipHandler()
-
-
-
-def extract_custom_emoji_ids(message: Message) -> list[str]:
-    ids = []
-    entities = list(message.entities or []) + list(message.caption_entities or [])
-    for ent in entities:
-        if getattr(ent, "type", None) == "custom_emoji" and getattr(ent, "custom_emoji_id", None):
-            ids.append(ent.custom_emoji_id)
-    return ids
-
-
-def extract_custom_emoji_fallback(message: Message) -> str:
-    raw = getattr(message, 'text', None) or getattr(message, 'caption', None) or ''
-    entities = list(message.entities or []) + list(message.caption_entities or [])
-    for ent in entities:
-        if getattr(ent, 'type', None) == 'custom_emoji':
-            offset = int(getattr(ent, 'offset', 0) or 0)
-            length = int(getattr(ent, 'length', 0) or 0)
-            if length > 0 and len(raw) >= offset + length:
-                fallback = raw[offset:offset + length].strip()
-                if fallback:
-                    return fallback[:2]
-    sticker = getattr(message, 'sticker', None)
-    if sticker and getattr(sticker, 'emoji', None):
-        return str(sticker.emoji).strip()[:2] or '📱'
-    raw = raw.strip()
-    if raw and not raw.isdigit():
-        return raw[:2]
-    return '📱'
-
-def build_sticker_info_lines(sticker=None, custom_ids=None):
-    lines = []
-    if sticker:
-        lines.append(f"<b>file_id:</b> <code>{sticker.file_id}</code>")
-        lines.append(f"<b>file_unique_id:</b> <code>{sticker.file_unique_id}</code>")
-        if getattr(sticker, 'set_name', None):
-            lines.append(f"<b>set_name:</b> <code>{sticker.set_name}</code>")
-        if getattr(sticker, 'emoji', None):
-            lines.append(f"<b>emoji:</b> {escape(sticker.emoji)}")
-        if getattr(sticker, 'custom_emoji_id', None):
-            lines.append(f"<b>custom_emoji_id:</b> <code>{sticker.custom_emoji_id}</code>")
-        if getattr(sticker, 'is_animated', None) is not None:
-            lines.append(f"<b>animated:</b> <code>{sticker.is_animated}</code>")
-        if getattr(sticker, 'is_video', None) is not None:
-            lines.append(f"<b>video:</b> <code>{sticker.is_video}</code>")
-    for cid in custom_ids or []:
-        lines.append(f"<b>custom_emoji_id:</b> <code>{cid}</code>")
-    return lines
 
 @router.message(Command("stickerid", "emojiid", "premiumemojiid"))
 async def stickerid_command(message: Message, state: FSMContext):
@@ -7233,8 +7134,18 @@ async def legacy_take_commands(message: Message):
     await message.answer("Команды операторов отключены. Используй <b>/esim</b>.")
 
 
+
+RESERVED_BOT_COMMANDS_FOR_DYNAMIC_STUB = {
+    "/start", "/admin", "/esim", "/work", "/topic", "/emojiid",
+    "/closeholds", "/clearqueue", "/adminclear", "/stata", "/stats"
+}
+
 @router.message(F.text.regexp(r"^/[A-Za-z0-9_]+(?:@\w+)?$"))
 async def dynamic_operator_command_stub(message: Message):
+    raw_cmd_for_stub = ((message.text or "").split()[0]).split("@")[0].lower()
+    if raw_cmd_for_stub in RESERVED_BOT_COMMANDS_FOR_DYNAMIC_STUB:
+        logging.info("dynamic_operator_command_stub reserved skip raw=%s chat_id=%s user_id=%s", raw_cmd_for_stub, message.chat.id, getattr(message.from_user, "id", None))
+        return
     raw = (message.text or '').split()[0].split('@')[0].lower()
     if raw in {'/start','/admin','/work','/topic','/esim','/stata'}:
         logging.info("dynamic_operator_command_stub skip raw=%s chat_id=%s user_id=%s", raw, message.chat.id, getattr(message.from_user, 'id', None))
@@ -7295,7 +7206,6 @@ def build_sticker_info_lines(sticker=None, custom_ids=None):
     for cid in custom_ids or []:
         lines.append(f"<b>custom_emoji_id:</b> <code>{cid}</code>")
     return lines
-
 @router.message(Command("stickerid", "emojiid", "premiumemojiid"))
 async def stickerid_command(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -8910,6 +8820,48 @@ async def db_export_compact_cmd(message: Message):
 
 
 
+
+
+
+@router.message(Command("closeholds"))
+async def closeholds_cmd(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Нет доступа.")
+        return
+    count = admin_close_all_holds_no_pay(message.from_user.id)
+    await message.answer(
+        f"✅ Закрыто холдов без оплаты: <b>{count}</b>\n\n"
+        "Балансы не изменялись. У пользователей эти заявки больше не активны."
+    )
+
+
+@router.message(Command("clearqueue"))
+async def clearqueue_cmd(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Нет доступа.")
+        return
+    count = admin_remove_all_from_queue(message.from_user.id)
+    await message.answer(
+        f"✅ Убрано активных заявок из очереди: <b>{count}</b>\n\n"
+        "Балансы не изменялись. У пользователей эти заявки больше не активны."
+    )
+
+
+@router.message(Command("adminclear"))
+async def adminclear_cmd(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Нет доступа.")
+        return
+    all_count, hold_count = active_queue_counts_for_admin()
+    await message.answer(
+        "🧹 <b>Очистка очередей</b>\n\n"
+        f"Активных заявок всего: <b>{all_count}</b>\n"
+        f"Активных холдов: <b>{hold_count}</b>\n\n"
+        "Можно нажать кнопки ниже или использовать команды:\n"
+        "<code>/closeholds</code> — закрыть все холды без оплаты\n"
+        "<code>/clearqueue</code> — убрать всё из очереди",
+        reply_markup=admin_cleanup_queue_keyboard()
+    )
 
 async def main():
     global LIVE_DP, PRIMARY_BOT
