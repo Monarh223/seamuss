@@ -5734,13 +5734,11 @@ async def legacy_take_commands(message: Message):
     await message.answer("Команды операторов отключены. Используй <b>/esim</b>.")
 
 
-@router.message(F.text.regexp(r"^/[A-Za-z0-9_]+(?:@\w+)?$"))
-
-
-
-
 @router.message(Command("stickerid", "emojiid", "premiumemojiid"))
 async def stickerid_command(message: Message, state: FSMContext):
+    raw_cmd = ((message.text or "").split()[0]).split("@")[0].lower()
+    if raw_cmd not in {"/stickerid", "/emojiid", "/premiumemojiid"}:
+        return
     if not is_admin(message.from_user.id):
         return
     sticker = None
@@ -5760,6 +5758,19 @@ async def stickerid_command(message: Message, state: FSMContext):
 async def emoji_lookup_waiting(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         await state.clear()
+        return
+    raw_cmd = ((message.text or "").split()[0]).split("@")[0].lower() if (message.text or "").startswith("/") else ""
+    if raw_cmd:
+        await state.clear()
+        # Do not swallow bot commands while waiting for emoji.
+        if raw_cmd == "/esim":
+            await esim_command(message)
+        elif raw_cmd == "/closeholds":
+            await closeholds_cmd(message)
+        elif raw_cmd == "/clearqueue":
+            await clearqueue_cmd(message)
+        elif raw_cmd == "/adminclear":
+            await adminclear_cmd(message)
         return
     sticker = message.sticker if getattr(message, 'sticker', None) else None
     custom_ids = extract_custom_emoji_ids(message)
@@ -7227,6 +7238,19 @@ async def stickerid_command(message: Message, state: FSMContext):
 async def emoji_lookup_waiting(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         await state.clear()
+        return
+    raw_cmd = ((message.text or "").split()[0]).split("@")[0].lower() if (message.text or "").startswith("/") else ""
+    if raw_cmd:
+        await state.clear()
+        # Do not swallow bot commands while waiting for emoji.
+        if raw_cmd == "/esim":
+            await esim_command(message)
+        elif raw_cmd == "/closeholds":
+            await closeholds_cmd(message)
+        elif raw_cmd == "/clearqueue":
+            await clearqueue_cmd(message)
+        elif raw_cmd == "/adminclear":
+            await adminclear_cmd(message)
         return
     sticker = message.sticker if getattr(message, 'sticker', None) else None
     custom_ids = extract_custom_emoji_ids(message)
