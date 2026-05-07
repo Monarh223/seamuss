@@ -3749,11 +3749,11 @@ async def notify_user(bot: Bot, user_id: int, text: str):
 
 
 def make_compact_db_copy(max_mb: int = 19) -> Path | None:
-    """Create a compact export copy of current DB without replacing live DB.
+    """Создаёт компактный ZIP с bot.db до лимита Telegram.
 
-    This is for emergency cases when live bot.db is too large to export via Telegram.
-    It removes heavy old QR blobs only from the COPY, keeps balances/users/operators/history.
-    Active queue items are kept with QR blobs when possible.
+    Работает только с копией: живая БД не заменяется. Если копия всё ещё
+    больше лимита, из копии удаляются qr_blob. Номера, пользователи, балансы,
+    операторы, история и qr_file_id остаются.
     """
     try:
         src_path = Path(DB_PATH)
@@ -3764,7 +3764,6 @@ def make_compact_db_copy(max_mb: int = 19) -> Path | None:
         raw_copy = export_dir / "bot_compact_export.db"
         zip_copy = export_dir / "bot_compact_export.zip"
 
-        # Make transaction-safe SQLite copy.
         try:
             with sqlite3.connect(str(src_path)) as source:
                 with sqlite3.connect(str(raw_copy)) as dest:
@@ -3775,76 +3774,74 @@ def make_compact_db_copy(max_mb: int = 19) -> Path | None:
         conn = sqlite3.connect(str(raw_copy))
         conn.row_factory = sqlite3.Row
 
-        def size_mb():
-            try:
-                return raw_copy.stat().st_size / (1024 * 1024)
-            except Exception:
-                return 0
+        def size_mb() -> float:
+            return raw_copy.stat().st_size / (1024 * 1024)
 
-        # First pass: remove blobs from old closed items, keep last 300 blobs.
-        try:
-            conn.execute("""
+        active = ("queued", "taken", "in_progress", "waiting_check", "checking", "on_hold", "hold", "review", "check", "work", "processing")
+        active_sql = ",".join([f"'{x}'" for x in active])
+
+        def run(sql: str, label: str):
+            try:
+                cur = conn.execute(sql)
+                conn.commit()
+                conn.execute("VACUUM")
+                logging.warning("compact export step=%s rows=%s size=%.2fMB", label, cur.rowcount, size_mb())
+            except Exception:
+                logging.exception("compact export step failed: %s", label)
+
+        run(f"""
+            UPDATE queue_items
+               SET qr_blob=NULL, qr_mime=NULL, qr_filename=NULL
+             WHERE qr_blob IS NOT NULL
+               AND status NOT IN ({active_sql})
+               AND id NOT IN (
+                   SELECT id FROM queue_items
+                    WHERE qr_blob IS NOT NULL
+                    ORDER BY id DESC
+                    LIMIT 250
+               )
+        """, "closed_keep_250")
+
+        if size_mb() > max_mb:
+            run(f"""
                 UPDATE queue_items
                    SET qr_blob=NULL, qr_mime=NULL, qr_filename=NULL
                  WHERE qr_blob IS NOT NULL
-                   AND status NOT IN ('queued','taken','in_progress','waiting_check','checking','on_hold')
+                   AND status NOT IN ({active_sql})
                    AND id NOT IN (
                        SELECT id FROM queue_items
                         WHERE qr_blob IS NOT NULL
                         ORDER BY id DESC
+                        LIMIT 100
+                   )
+            """, "closed_keep_100")
+
+        if size_mb() > max_mb:
+            run(f"""
+                UPDATE queue_items
+                   SET qr_blob=NULL, qr_mime=NULL, qr_filename=NULL
+                 WHERE qr_blob IS NOT NULL
+                   AND id NOT IN (
+                       SELECT id FROM queue_items
+                        WHERE qr_blob IS NOT NULL
+                          AND status IN ({active_sql})
+                        ORDER BY id DESC
                         LIMIT 300
                    )
-            """)
-            conn.commit()
-            conn.execute("VACUUM")
-        except Exception:
-            logging.exception("compact export first cleanup failed")
+                   AND id NOT IN (
+                       SELECT id FROM queue_items
+                        WHERE qr_blob IS NOT NULL
+                        ORDER BY id DESC
+                        LIMIT 30
+                   )
+            """, "active_plus_latest_30")
 
-        # Stronger pass if still too big: keep active + latest 120 blobs only.
         if size_mb() > max_mb:
-            try:
-                conn.execute("""
-                    UPDATE queue_items
-                       SET qr_blob=NULL, qr_mime=NULL, qr_filename=NULL
-                     WHERE qr_blob IS NOT NULL
-                       AND status NOT IN ('queued','taken','in_progress','waiting_check','checking','on_hold')
-                       AND id NOT IN (
-                           SELECT id FROM queue_items
-                            WHERE qr_blob IS NOT NULL
-                            ORDER BY id DESC
-                            LIMIT 120
-                       )
-                """)
-                conn.commit()
-                conn.execute("VACUUM")
-            except Exception:
-                logging.exception("compact export second cleanup failed")
-
-        # Emergency pass: keep active QR blobs + latest 50 blobs only.
-        if size_mb() > max_mb:
-            try:
-                conn.execute("""
-                    UPDATE queue_items
-                       SET qr_blob=NULL, qr_mime=NULL, qr_filename=NULL
-                     WHERE qr_blob IS NOT NULL
-                       AND id NOT IN (
-                           SELECT id FROM queue_items
-                            WHERE qr_blob IS NOT NULL
-                              AND status IN ('queued','taken','in_progress','waiting_check','checking','on_hold')
-                            ORDER BY id DESC
-                            LIMIT 300
-                       )
-                       AND id NOT IN (
-                           SELECT id FROM queue_items
-                            WHERE qr_blob IS NOT NULL
-                            ORDER BY id DESC
-                            LIMIT 50
-                       )
-                """)
-                conn.commit()
-                conn.execute("VACUUM")
-            except Exception:
-                logging.exception("compact export emergency cleanup failed")
+            run("""
+                UPDATE queue_items
+                   SET qr_blob=NULL, qr_mime=NULL, qr_filename=NULL
+                 WHERE qr_blob IS NOT NULL
+            """, "remove_all_blobs")
 
         conn.close()
 
@@ -3862,93 +3859,6 @@ def make_compact_db_copy(max_mb: int = 19) -> Path | None:
     except Exception:
         logging.exception("make_compact_db_copy failed")
         return None
-
-
-
-
-ACTIVE_QUEUE_STATUSES = ("queued", "taken", "in_progress", "waiting_check", "checking", "on_hold")
-
-
-BULK_ACTIVE_STATUSES = ("queued", "taken", "in_progress", "waiting_check", "checking", "on_hold", "hold", "review", "check", "work", "processing")
-
-def _bulk_status_placeholders():
-    return ",".join(["?"] * len(BULK_ACTIVE_STATUSES))
-
-def admin_cleanup_queue_keyboard():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🧹 Закрыть все холды", callback_data="admin:close_all_holds_confirm")
-    kb.button(text="🗑 Убрать всё из очереди", callback_data="admin:remove_all_queue_confirm")
-    kb.button(text="↩️ Назад", callback_data="admin:home")
-    kb.adjust(1)
-    return kb.as_markup()
-
-
-def admin_close_all_holds_no_pay(admin_id: int | None = None) -> int:
-    """Close all active HOLD requests without payment/accrual."""
-    try:
-        placeholders = _bulk_status_placeholders()
-        cur = db.conn.execute(
-            f"""
-            UPDATE queue_items
-               SET status='failed',
-                   fail_reason='admin_closed_hold_no_pay',
-                   completed_at=COALESCE(completed_at, ?)
-             WHERE mode='hold'
-               AND status IN ({placeholders})
-            """,
-            [now_str(), *BULK_ACTIVE_STATUSES],
-        )
-        db.conn.commit()
-        count = int(cur.rowcount or 0)
-        logging.warning("ADMIN BULK close all holds no pay admin_id=%s count=%s", admin_id, count)
-        return count
-    except Exception:
-        logging.exception("admin_close_all_holds_no_pay failed")
-        return 0
-
-
-def admin_remove_all_from_queue(admin_id: int | None = None) -> int:
-    """Remove/close all active requests from queue without payment."""
-    try:
-        placeholders = _bulk_status_placeholders()
-        cur = db.conn.execute(
-            f"""
-            UPDATE queue_items
-               SET status='failed',
-                   fail_reason='admin_removed_all_queue',
-                   completed_at=COALESCE(completed_at, ?)
-             WHERE status IN ({placeholders})
-            """,
-            [now_str(), *BULK_ACTIVE_STATUSES],
-        )
-        db.conn.commit()
-        count = int(cur.rowcount or 0)
-        logging.warning("ADMIN BULK remove all active queue admin_id=%s count=%s", admin_id, count)
-        return count
-    except Exception:
-        logging.exception("admin_remove_all_from_queue failed")
-        return 0
-
-
-def active_queue_counts_for_admin() -> tuple[int, int]:
-    try:
-        placeholders = _bulk_status_placeholders()
-        all_row = db.conn.execute(
-            f"SELECT COUNT(*) AS c FROM queue_items WHERE status IN ({placeholders})",
-            BULK_ACTIVE_STATUSES,
-        ).fetchone()
-        hold_row = db.conn.execute(
-            f"SELECT COUNT(*) AS c FROM queue_items WHERE mode='hold' AND status IN ({placeholders})",
-            BULK_ACTIVE_STATUSES,
-        ).fetchone()
-        return int((all_row["c"] if all_row else 0) or 0), int((hold_row["c"] if hold_row else 0) or 0)
-    except Exception:
-        logging.exception("active_queue_counts_for_admin failed")
-        return 0, 0
-
-
-def normalize_active_statuses_after_db_upload() -> int:
-    return 0
 
 
 async def send_compact_db_export(message: Message):
@@ -3971,6 +3881,7 @@ async def send_compact_db_export(message: Message):
     )
 
 async def send_db_backup(bot: Bot, reason: str = "auto"):
+    """Автовыгрузка отправляет компактную копию БД, а не сырой bot.db."""
     channel_id = backup_channel_id()
     if not channel_id:
         return False
@@ -3978,23 +3889,25 @@ async def send_db_backup(bot: Bot, reason: str = "auto"):
     if not db_path.exists():
         logging.warning("DB backup skipped: DB file not found")
         return False
-    backup_dir = Path("db_backups")
-    backup_dir.mkdir(exist_ok=True)
-    stamp = msk_now().strftime("%Y%m%d_%H%M%S")
-    target = backup_dir / f"botdb_{reason}_{stamp}.db"
     try:
-        target.write_bytes(db_path.read_bytes())
+        cleanup_database_size(19)
+        compact = make_compact_db_copy(19)
+        target_path = Path(compact) if compact and Path(compact).exists() else db_path
+        size_mb = target_path.stat().st_size / (1024 * 1024)
         caption = (
             "<b>🗄 Автовыгрузка базы данных</b>\n\n"
             f"🕒 {escape(now_str())}\n"
-            f"🔖 Причина: <b>{escape(reason)}</b>"
+            f"🔖 Причина: <b>{escape(reason)}</b>\n"
+            f"📦 Размер: <b>{size_mb:.2f} MB</b>\n\n"
+            "Отправлена компактная копия БД."
         )
-        await bot.send_document(channel_id, FSInputFile(str(target)), caption=caption)
-        logging.info("DB backup sent to %s (%s)", channel_id, reason)
+        await bot.send_document(channel_id, FSInputFile(str(target_path)), caption=caption)
+        logging.info("DB compact backup sent to %s reason=%s file=%s size=%.2fMB", channel_id, reason, target_path, size_mb)
         return True
     except Exception:
         logging.exception("send_db_backup failed")
         return False
+
 
 async def backup_watcher(bot: Bot):
     while True:
@@ -8656,12 +8569,7 @@ async def track_any_message(message: Message):
 
 
 def cleanup_database_size(max_mb: int = 19):
-    """Сжимает bot.db, чтобы база не раздувалась от старых QR/blob.
-
-    Номера, операторы, история, статистика и file_id остаются.
-    Удаляются только тяжёлые qr_blob у старых закрытых заявок, когда база выше лимита.
-    Активные заявки и последние QR сохраняются.
-    """
+    """Сжимает живую bot.db до лимита за счёт удаления старых QR blob."""
     try:
         db_path = Path(DB_PATH)
         if not db_path.exists():
@@ -8671,66 +8579,88 @@ def cleanup_database_size(max_mb: int = 19):
             return
         logging.warning("DB cleanup started: %.2f MB > %s MB", before, max_mb)
 
-        # Убираем blob только у старых закрытых заявок. qr_file_id/номер/оператор остаются.
-        try:
-            db.conn.execute("""
+        active = ("queued", "taken", "in_progress", "waiting_check", "checking", "on_hold", "hold", "review", "check", "work", "processing")
+        active_sql = ",".join([f"'{x}'" for x in active])
+
+        def run(sql: str, label: str):
+            try:
+                cur = db.conn.execute(sql)
+                db.conn.commit()
+                db.conn.execute("VACUUM")
+                db.conn.commit()
+                logging.warning("DB cleanup step=%s rows=%s size=%.2fMB", label, cur.rowcount, db_path.stat().st_size / (1024 * 1024))
+            except Exception:
+                logging.exception("DB cleanup step failed: %s", label)
+
+        run(f"""
+            UPDATE queue_items
+               SET qr_blob=NULL, qr_mime=NULL, qr_filename=NULL
+             WHERE qr_blob IS NOT NULL
+               AND status NOT IN ({active_sql})
+               AND id NOT IN (
+                   SELECT id FROM queue_items
+                    WHERE qr_blob IS NOT NULL
+                    ORDER BY id DESC
+                    LIMIT 250
+               )
+        """, "closed_keep_250")
+
+        if db_path.stat().st_size / (1024 * 1024) > max_mb:
+            run(f"""
                 UPDATE queue_items
                    SET qr_blob=NULL, qr_mime=NULL, qr_filename=NULL
                  WHERE qr_blob IS NOT NULL
-                   AND status IN ('completed','paid','failed','slipped','cancelled')
+                   AND status NOT IN ({active_sql})
                    AND id NOT IN (
                        SELECT id FROM queue_items
                         WHERE qr_blob IS NOT NULL
                         ORDER BY id DESC
+                        LIMIT 100
+                   )
+            """, "closed_keep_100")
+
+        if db_path.stat().st_size / (1024 * 1024) > max_mb:
+            run(f"""
+                UPDATE queue_items
+                   SET qr_blob=NULL, qr_mime=NULL, qr_filename=NULL
+                 WHERE qr_blob IS NOT NULL
+                   AND id NOT IN (
+                       SELECT id FROM queue_items
+                        WHERE qr_blob IS NOT NULL
+                          AND status IN ({active_sql})
+                        ORDER BY id DESC
                         LIMIT 300
                    )
-            """)
-            db.conn.commit()
-        except Exception:
-            logging.exception("DB cleanup closed qr_blob cleanup failed")
+                   AND id NOT IN (
+                       SELECT id FROM queue_items
+                        WHERE qr_blob IS NOT NULL
+                        ORDER BY id DESC
+                        LIMIT 30
+                   )
+            """, "active_plus_latest_30")
 
-        # Если всё ещё большая — оставляем активные + последние 150 blob.
-        try:
-            mid = db_path.stat().st_size / (1024 * 1024)
-            if mid > max_mb:
-                db.conn.execute("""
-                    UPDATE queue_items
-                       SET qr_blob=NULL, qr_mime=NULL, qr_filename=NULL
-                     WHERE qr_blob IS NOT NULL
-                       AND status NOT IN ('queued','taken','in_progress')
-                       AND id NOT IN (
-                           SELECT id FROM queue_items
-                            WHERE qr_blob IS NOT NULL
-                            ORDER BY id DESC
-                            LIMIT 150
-                       )
-                """)
-                db.conn.commit()
-        except Exception:
-            logging.exception("DB cleanup stronger qr_blob cleanup failed")
+        if db_path.stat().st_size / (1024 * 1024) > max_mb:
+            run("""
+                UPDATE queue_items
+                   SET qr_blob=NULL, qr_mime=NULL, qr_filename=NULL
+                 WHERE qr_blob IS NOT NULL
+            """, "remove_all_blobs")
 
-        # Чистим возможные служебные логи, если такие таблицы есть.
         for table in ("logs", "event_logs", "admin_logs"):
             try:
-                db.conn.execute(f"DELETE FROM {table} WHERE id NOT IN (SELECT id FROM {table} ORDER BY id DESC LIMIT 5000)")
+                db.conn.execute(f"DELETE FROM {table} WHERE id NOT IN (SELECT id FROM {table} ORDER BY id DESC LIMIT 3000)")
                 db.conn.commit()
             except Exception:
                 pass
-
         try:
             db.conn.execute("VACUUM")
             db.conn.commit()
         except Exception:
-            logging.exception("DB cleanup VACUUM failed")
-
+            pass
         after = db_path.stat().st_size / (1024 * 1024)
         logging.warning("DB cleanup finished: %.2f MB -> %.2f MB", before, after)
     except Exception:
         logging.exception("cleanup_database_size failed")
-
-
-
-
 
 
 
@@ -8886,6 +8816,16 @@ async def adminclear_cmd(message: Message):
         "<code>/clearqueue</code> — убрать всё из очереди",
         reply_markup=admin_cleanup_queue_keyboard()
     )
+
+@router.message(Command("dbclean"))
+async def dbclean_cmd(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    before = Path(DB_PATH).stat().st_size / (1024 * 1024) if Path(DB_PATH).exists() else 0
+    cleanup_database_size(19)
+    after = Path(DB_PATH).stat().st_size / (1024 * 1024) if Path(DB_PATH).exists() else 0
+    await message.answer(f"✅ Очистка БД выполнена\n\nБыло: <b>{before:.2f} MB</b>\nСтало: <b>{after:.2f} MB</b>")
+
 
 async def main():
     global LIVE_DP, PRIMARY_BOT
