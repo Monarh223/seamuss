@@ -1920,15 +1920,18 @@ def render_start(user_id: int) -> str:
             return f"${int(v)}"
         return f"${v:.2f}".rstrip("0").rstrip(".")
 
+    user_price_rows = { (r['operator_key'], r['mode']): r for r in (db.list_user_prices(user_id) or []) }
+    queue_counts = visible_operator_queue_counts()
     price_rows: list[str] = []
     for key in visible_operator_keys():
         data = OPERATORS.get(key, {})
         emoji = op_emoji_html(key)
         title_op = escape(str(data.get("title", key)))
-        hp = money_short(get_mode_price(key, "hold", user_id))
-        np = money_short(get_mode_price(key, "no_hold", user_id))
-        qh = count_waiting_mode(key, "hold")
-        qn = count_waiting_mode(key, "no_hold")
+        urow_hold = user_price_rows.get((key, "hold"))
+        urow_no = user_price_rows.get((key, "no_hold"))
+        hp = money_short(urow_hold['price']) if urow_hold else money_short(get_mode_price(key, 'hold', user_id))
+        np = money_short(urow_no['price']) if urow_no else money_short(get_mode_price(key, 'no_hold', user_id))
+        qh, qn = queue_counts.get(key, (0, 0))
         # Х/БХ = очередь холд / безхолд. Всё в одну ровную строку.
         price_rows.append(f"{emoji} <b>{title_op}</b> — {hp}/{np} · <i>{qh}/{qn}</i>")
 
@@ -1952,15 +1955,18 @@ def render_start(user_id: int) -> str:
     # но не отправляем вторую плашку.
     if _html_visible_len(text) > 1000:
         price_rows = []
+        user_price_rows = {r["operator_key"]: r for r in (db.list_user_prices(user_id) or [])}
+        queue_counts = visible_operator_queue_counts()
         for key in visible_operator_keys():
             data = OPERATORS.get(key, {})
             # ВАЖНО: даже в компактном режиме оставляем premium emoji через <tg-emoji>.
             emoji = op_emoji_html(key)
             title_op = escape(_strip_html_tags(str(data.get("title", key))))
-            hp = money_short(get_mode_price(key, "hold", user_id))
-            np = money_short(get_mode_price(key, "no_hold", user_id))
-            qh = count_waiting_mode(key, "hold")
-            qn = count_waiting_mode(key, "no_hold")
+            urow_hold = user_price_rows.get((key, "hold"))
+            urow_no = user_price_rows.get((key, "no_hold"))
+            hp = money_short(urow_hold["price"]) if urow_hold else money_short(get_mode_price(key, "hold", user_id))
+            np = money_short(urow_no["price"]) if urow_no else money_short(get_mode_price(key, "no_hold", user_id))
+            qh, qn = queue_counts.get(key, (0, 0))
             price_rows.append(f"{emoji} <b>{title_op}</b> — {hp}/{np} · <i>{qh}/{qn}</i>")
         prices_block_compact = "\n".join(price_rows)
         text = (
@@ -2259,9 +2265,8 @@ def render_admin_home() -> str:
 
 
 def summary_stats_for_period(day_start: str, day_end: str):
-    date_expr = "COALESCE(completed_at, work_started_at, taken_at, created_at)"
     submitted = db.conn.execute(
-        "SELECT COUNT(*) AS submitted_total FROM queue_items WHERE created_at>=? AND created_at<?",
+        "SELECT COUNT(*) AS submitted_total FROM queue_items WHERE (created_at>=? AND created_at<?) OR status IN ('queued','taken','in_progress','waiting_check','checking','on_hold')",
         (day_start, day_end),
     ).fetchone()
     actions = db.conn.execute(
@@ -2273,7 +2278,7 @@ def summary_stats_for_period(day_start: str, day_end: str):
             SUM(CASE WHEN fail_reason LIKE 'error%' THEN 1 ELSE 0 END) AS errors_total,
             SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price ELSE 0 END) AS margin_total
         FROM queue_items
-        WHERE {date_expr}>=? AND {date_expr}<?
+        WHERE (created_at>=? AND created_at<?) OR status IN ('queued','taken','in_progress','waiting_check','checking','on_hold')
         """,
         (day_start, day_end),
     ).fetchone()
@@ -2289,7 +2294,7 @@ def summary_stats_for_period(day_start: str, day_end: str):
 
 def render_admin_summary_for_date(day_start: str, day_end: str, day_label: str) -> str:
     totals = db.conn.execute(
-        """
+        f"""
         SELECT
             COUNT(*) AS submitted_total,
             SUM(CASE WHEN taken_at IS NOT NULL THEN 1 ELSE 0 END) AS taken_total,
@@ -2298,7 +2303,9 @@ def render_admin_summary_for_date(day_start: str, day_end: str, day_label: str) 
             SUM(CASE WHEN fail_reason LIKE 'error%' THEN 1 ELSE 0 END) AS errors_total,
             SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price ELSE 0 END) AS margin_total
         FROM queue_items
-        """
+        WHERE (created_at>=? AND created_at<?) OR status IN ('queued','taken','in_progress','waiting_check','checking','on_hold')
+        """,
+        (day_start, day_end),
     ).fetchone()
     daily = summary_stats_for_period(day_start, day_end)
     lines = []
@@ -2516,13 +2523,14 @@ def status_label(status: str, fail_reason: Optional[str] = None, mode: str | Non
     status = str(status or "").lower()
     mode = str(mode or "").lower()
     fail_reason = str(fail_reason or "")
-    if status == "queued":
+    if status in ("queued", "new"):
         return "В очереди"
-    if status in ("taken", "in_progress"):
-        # После нажатия "Встал" у холда заявка сидит в in_progress без fail_reason=instant.
-        if status == "in_progress" and fail_reason != "instant":
-            return "На холде" if mode == "hold" else "На проверке"
+    if status == "taken":
         return "В обработке"
+    if status in ("in_progress", "waiting_check", "checking"):
+        return "На холде" if mode == "hold" else "На проверке"
+    if status in ("on_hold", "hold"):
+        return "На холде"
     if status == "completed":
         return "Оплата"
     if status == "failed":
@@ -2543,6 +2551,28 @@ def status_label_from_row(row) -> str:
         row["fail_reason"] if "fail_reason" in row.keys() else None,
         row["mode"] if "mode" in row.keys() else None,
     )
+
+
+ACTIVE_DISPLAY_QUEUE_STATUSES = ('queued', 'taken', 'in_progress', 'waiting_check', 'checking', 'on_hold')
+
+def visible_operator_queue_counts() -> dict[str, tuple[int, int]]:
+    keys = visible_operator_keys()
+    if not keys:
+        return {}
+    placeholders = ",".join(["?"] * len(keys))
+    rows = db.conn.execute(
+        f"""
+        SELECT operator_key,
+               SUM(CASE WHEN mode='hold' AND status='queued' THEN 1 ELSE 0 END) AS hold_q,
+               SUM(CASE WHEN mode='no_hold' AND status='queued' THEN 1 ELSE 0 END) AS no_hold_q
+          FROM queue_items
+         WHERE operator_key IN ({placeholders})
+           AND status='queued'
+         GROUP BY operator_key
+        """,
+        tuple(keys),
+    ).fetchall()
+    return {row["operator_key"]: (int(row["hold_q"] or 0), int(row["no_hold_q"] or 0)) for row in rows}
 
 def looks_like_payout_link(raw: str) -> bool:
     raw = (raw or "").strip()
@@ -3289,19 +3319,20 @@ def user_today_queue_items(user_id: int):
 def user_daily_submit_stats(user_id: int, day_start: str | None = None, day_end: str | None = None):
     if day_start is None or day_end is None:
         day_start, day_end = msk_day_window()
+    active_sql = "('queued','taken','in_progress','waiting_check','checking','on_hold')"
     return db.conn.execute(
-        """
+        f"""
         SELECT
             COUNT(*) AS total,
             SUM(CASE WHEN status='queued' THEN 1 ELSE 0 END) AS queued,
             SUM(CASE WHEN status='taken' THEN 1 ELSE 0 END) AS taken,
-            SUM(CASE WHEN status='in_progress' THEN 1 ELSE 0 END) AS in_progress,
+            SUM(CASE WHEN status IN ('in_progress','waiting_check','checking','on_hold') THEN 1 ELSE 0 END) AS in_progress,
             SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed,
             SUM(CASE WHEN fail_reason='slip' THEN 1 ELSE 0 END) AS slipped,
             SUM(CASE WHEN fail_reason LIKE 'error%' THEN 1 ELSE 0 END) AS errors,
             SUM(CASE WHEN status='completed' THEN price ELSE 0 END) AS earned
         FROM queue_items
-        WHERE user_id=? AND created_at>=? AND created_at<?
+        WHERE user_id=? AND ((created_at>=? AND created_at<?) OR status IN {active_sql})
         """,
         (int(user_id), day_start, day_end),
     ).fetchone()
@@ -3309,7 +3340,7 @@ def user_daily_submit_stats(user_id: int, day_start: str | None = None, day_end:
 
 def user_active_queue_items(user_id: int):
     return db.conn.execute(
-        "SELECT * FROM queue_items WHERE user_id=? AND status IN ('queued','taken','in_progress') ORDER BY id DESC",
+        "SELECT * FROM queue_items WHERE user_id=? AND status IN ('queued','taken','in_progress','waiting_check','checking','on_hold') ORDER BY id DESC",
         (user_id,),
     ).fetchall()
 
@@ -3749,11 +3780,11 @@ async def notify_user(bot: Bot, user_id: int, text: str):
 
 
 def make_compact_db_copy(max_mb: int = 19) -> Path | None:
-    """Создаёт компактный ZIP с bot.db до лимита Telegram.
+    """Create a compact export copy of current DB without replacing live DB.
 
-    Работает только с копией: живая БД не заменяется. Если копия всё ещё
-    больше лимита, из копии удаляются qr_blob. Номера, пользователи, балансы,
-    операторы, история и qr_file_id остаются.
+    This is for emergency cases when live bot.db is too large to export via Telegram.
+    It removes heavy old QR blobs only from the COPY, keeps balances/users/operators/history.
+    Active queue items are kept with QR blobs when possible.
     """
     try:
         src_path = Path(DB_PATH)
@@ -3764,6 +3795,7 @@ def make_compact_db_copy(max_mb: int = 19) -> Path | None:
         raw_copy = export_dir / "bot_compact_export.db"
         zip_copy = export_dir / "bot_compact_export.zip"
 
+        # Make transaction-safe SQLite copy.
         try:
             with sqlite3.connect(str(src_path)) as source:
                 with sqlite3.connect(str(raw_copy)) as dest:
@@ -3774,74 +3806,76 @@ def make_compact_db_copy(max_mb: int = 19) -> Path | None:
         conn = sqlite3.connect(str(raw_copy))
         conn.row_factory = sqlite3.Row
 
-        def size_mb() -> float:
-            return raw_copy.stat().st_size / (1024 * 1024)
-
-        active = ("queued", "taken", "in_progress", "waiting_check", "checking", "on_hold", "hold", "review", "check", "work", "processing")
-        active_sql = ",".join([f"'{x}'" for x in active])
-
-        def run(sql: str, label: str):
+        def size_mb():
             try:
-                cur = conn.execute(sql)
-                conn.commit()
-                conn.execute("VACUUM")
-                logging.warning("compact export step=%s rows=%s size=%.2fMB", label, cur.rowcount, size_mb())
+                return raw_copy.stat().st_size / (1024 * 1024)
             except Exception:
-                logging.exception("compact export step failed: %s", label)
+                return 0
 
-        run(f"""
-            UPDATE queue_items
-               SET qr_blob=NULL, qr_mime=NULL, qr_filename=NULL
-             WHERE qr_blob IS NOT NULL
-               AND status NOT IN ({active_sql})
-               AND id NOT IN (
-                   SELECT id FROM queue_items
-                    WHERE qr_blob IS NOT NULL
-                    ORDER BY id DESC
-                    LIMIT 250
-               )
-        """, "closed_keep_250")
-
-        if size_mb() > max_mb:
-            run(f"""
+        # First pass: remove blobs from old closed items, keep last 300 blobs.
+        try:
+            conn.execute("""
                 UPDATE queue_items
                    SET qr_blob=NULL, qr_mime=NULL, qr_filename=NULL
                  WHERE qr_blob IS NOT NULL
-                   AND status NOT IN ({active_sql})
+                   AND status NOT IN ('queued','taken','in_progress','waiting_check','checking','on_hold')
                    AND id NOT IN (
                        SELECT id FROM queue_items
                         WHERE qr_blob IS NOT NULL
-                        ORDER BY id DESC
-                        LIMIT 100
-                   )
-            """, "closed_keep_100")
-
-        if size_mb() > max_mb:
-            run(f"""
-                UPDATE queue_items
-                   SET qr_blob=NULL, qr_mime=NULL, qr_filename=NULL
-                 WHERE qr_blob IS NOT NULL
-                   AND id NOT IN (
-                       SELECT id FROM queue_items
-                        WHERE qr_blob IS NOT NULL
-                          AND status IN ({active_sql})
                         ORDER BY id DESC
                         LIMIT 300
                    )
-                   AND id NOT IN (
-                       SELECT id FROM queue_items
-                        WHERE qr_blob IS NOT NULL
-                        ORDER BY id DESC
-                        LIMIT 30
-                   )
-            """, "active_plus_latest_30")
+            """)
+            conn.commit()
+            conn.execute("VACUUM")
+        except Exception:
+            logging.exception("compact export first cleanup failed")
 
+        # Stronger pass if still too big: keep active + latest 120 blobs only.
         if size_mb() > max_mb:
-            run("""
-                UPDATE queue_items
-                   SET qr_blob=NULL, qr_mime=NULL, qr_filename=NULL
-                 WHERE qr_blob IS NOT NULL
-            """, "remove_all_blobs")
+            try:
+                conn.execute("""
+                    UPDATE queue_items
+                       SET qr_blob=NULL, qr_mime=NULL, qr_filename=NULL
+                     WHERE qr_blob IS NOT NULL
+                       AND status NOT IN ('queued','taken','in_progress','waiting_check','checking','on_hold')
+                       AND id NOT IN (
+                           SELECT id FROM queue_items
+                            WHERE qr_blob IS NOT NULL
+                            ORDER BY id DESC
+                            LIMIT 120
+                       )
+                """)
+                conn.commit()
+                conn.execute("VACUUM")
+            except Exception:
+                logging.exception("compact export second cleanup failed")
+
+        # Emergency pass: keep active QR blobs + latest 50 blobs only.
+        if size_mb() > max_mb:
+            try:
+                conn.execute("""
+                    UPDATE queue_items
+                       SET qr_blob=NULL, qr_mime=NULL, qr_filename=NULL
+                     WHERE qr_blob IS NOT NULL
+                       AND id NOT IN (
+                           SELECT id FROM queue_items
+                            WHERE qr_blob IS NOT NULL
+                              AND status IN ('queued','taken','in_progress','waiting_check','checking','on_hold')
+                            ORDER BY id DESC
+                            LIMIT 300
+                       )
+                       AND id NOT IN (
+                           SELECT id FROM queue_items
+                            WHERE qr_blob IS NOT NULL
+                            ORDER BY id DESC
+                            LIMIT 50
+                       )
+                """)
+                conn.commit()
+                conn.execute("VACUUM")
+            except Exception:
+                logging.exception("compact export emergency cleanup failed")
 
         conn.close()
 
@@ -3859,6 +3893,93 @@ def make_compact_db_copy(max_mb: int = 19) -> Path | None:
     except Exception:
         logging.exception("make_compact_db_copy failed")
         return None
+
+
+
+
+ACTIVE_QUEUE_STATUSES = ("queued", "taken", "in_progress", "waiting_check", "checking", "on_hold")
+
+
+BULK_ACTIVE_STATUSES = ("queued", "taken", "in_progress", "waiting_check", "checking", "on_hold", "hold", "review", "check", "work", "processing")
+
+def _bulk_status_placeholders():
+    return ",".join(["?"] * len(BULK_ACTIVE_STATUSES))
+
+def admin_cleanup_queue_keyboard():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🧹 Закрыть все холды", callback_data="admin:close_all_holds_confirm")
+    kb.button(text="🗑 Убрать всё из очереди", callback_data="admin:remove_all_queue_confirm")
+    kb.button(text="↩️ Назад", callback_data="admin:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def admin_close_all_holds_no_pay(admin_id: int | None = None) -> int:
+    """Close all active HOLD requests without payment/accrual."""
+    try:
+        placeholders = _bulk_status_placeholders()
+        cur = db.conn.execute(
+            f"""
+            UPDATE queue_items
+               SET status='failed',
+                   fail_reason='admin_closed_hold_no_pay',
+                   completed_at=COALESCE(completed_at, ?)
+             WHERE mode='hold'
+               AND status IN ({placeholders})
+            """,
+            [now_str(), *BULK_ACTIVE_STATUSES],
+        )
+        db.conn.commit()
+        count = int(cur.rowcount or 0)
+        logging.warning("ADMIN BULK close all holds no pay admin_id=%s count=%s", admin_id, count)
+        return count
+    except Exception:
+        logging.exception("admin_close_all_holds_no_pay failed")
+        return 0
+
+
+def admin_remove_all_from_queue(admin_id: int | None = None) -> int:
+    """Remove/close all active requests from queue without payment."""
+    try:
+        placeholders = _bulk_status_placeholders()
+        cur = db.conn.execute(
+            f"""
+            UPDATE queue_items
+               SET status='failed',
+                   fail_reason='admin_removed_all_queue',
+                   completed_at=COALESCE(completed_at, ?)
+             WHERE status IN ({placeholders})
+            """,
+            [now_str(), *BULK_ACTIVE_STATUSES],
+        )
+        db.conn.commit()
+        count = int(cur.rowcount or 0)
+        logging.warning("ADMIN BULK remove all active queue admin_id=%s count=%s", admin_id, count)
+        return count
+    except Exception:
+        logging.exception("admin_remove_all_from_queue failed")
+        return 0
+
+
+def active_queue_counts_for_admin() -> tuple[int, int]:
+    try:
+        placeholders = _bulk_status_placeholders()
+        all_row = db.conn.execute(
+            f"SELECT COUNT(*) AS c FROM queue_items WHERE status IN ({placeholders})",
+            BULK_ACTIVE_STATUSES,
+        ).fetchone()
+        hold_row = db.conn.execute(
+            f"SELECT COUNT(*) AS c FROM queue_items WHERE mode='hold' AND status IN ({placeholders})",
+            BULK_ACTIVE_STATUSES,
+        ).fetchone()
+        return int((all_row["c"] if all_row else 0) or 0), int((hold_row["c"] if hold_row else 0) or 0)
+    except Exception:
+        logging.exception("active_queue_counts_for_admin failed")
+        return 0, 0
+
+
+def normalize_active_statuses_after_db_upload() -> int:
+    return 0
 
 
 async def send_compact_db_export(message: Message):
@@ -3881,7 +4002,6 @@ async def send_compact_db_export(message: Message):
     )
 
 async def send_db_backup(bot: Bot, reason: str = "auto"):
-    """Автовыгрузка отправляет компактную копию БД, а не сырой bot.db."""
     channel_id = backup_channel_id()
     if not channel_id:
         return False
@@ -3889,25 +4009,23 @@ async def send_db_backup(bot: Bot, reason: str = "auto"):
     if not db_path.exists():
         logging.warning("DB backup skipped: DB file not found")
         return False
+    backup_dir = Path("db_backups")
+    backup_dir.mkdir(exist_ok=True)
+    stamp = msk_now().strftime("%Y%m%d_%H%M%S")
+    target = backup_dir / f"botdb_{reason}_{stamp}.db"
     try:
-        cleanup_database_size(19)
-        compact = make_compact_db_copy(19)
-        target_path = Path(compact) if compact and Path(compact).exists() else db_path
-        size_mb = target_path.stat().st_size / (1024 * 1024)
+        target.write_bytes(db_path.read_bytes())
         caption = (
             "<b>🗄 Автовыгрузка базы данных</b>\n\n"
             f"🕒 {escape(now_str())}\n"
-            f"🔖 Причина: <b>{escape(reason)}</b>\n"
-            f"📦 Размер: <b>{size_mb:.2f} MB</b>\n\n"
-            "Отправлена компактная копия БД."
+            f"🔖 Причина: <b>{escape(reason)}</b>"
         )
-        await bot.send_document(channel_id, FSInputFile(str(target_path)), caption=caption)
-        logging.info("DB compact backup sent to %s reason=%s file=%s size=%.2fMB", channel_id, reason, target_path, size_mb)
+        await bot.send_document(channel_id, FSInputFile(str(target)), caption=caption)
+        logging.info("DB backup sent to %s (%s)", channel_id, reason)
         return True
     except Exception:
         logging.exception("send_db_backup failed")
         return False
-
 
 async def backup_watcher(bot: Bot):
     while True:
@@ -8183,12 +8301,16 @@ async def db_upload_wrong(message: Message):
 @router.message(Command("stata"))
 @router.message(Command("Stata"))
 async def group_stata(message: Message):
-    role = user_role(message.from_user.id)
-    if role not in {"chief_admin", "admin", "operator"}:
-        return
     if message.chat.type == ChatType.PRIVATE:
         await message.answer("Статистику групп смотрите через кнопку в /admin.")
         return
+    try:
+        member = await message.bot.get_chat_member(message.chat.id, message.from_user.id)
+        if str(getattr(member, "status", "unknown")) not in {"creator", "administrator", "member", "restricted"}:
+            await message.answer("⛔ Нет доступа.")
+            return
+    except Exception:
+        logging.exception("group_stata get_chat_member failed chat_id=%s user_id=%s", message.chat.id, getattr(message.from_user, "id", None))
     try:
         day_start, day_end, day_label = msk_today_bounds_str()
         chat_id = message.chat.id
@@ -8209,7 +8331,7 @@ async def group_stata(message: Message):
                 SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price ELSE 0 END) AS margin_total,
                 SUM(COALESCE(charge_amount, price)) AS turnover_total
             FROM queue_items
-            WHERE charge_chat_id=? AND charge_thread_id=? AND taken_at>=? AND taken_at<?
+            WHERE charge_chat_id=? AND charge_thread_id=? AND ((taken_at>=? AND taken_at<?) OR status IN ({active_sql}))
             """,
             (int(chat_id), thread_key, day_start, day_end),
         ).fetchone()
@@ -8223,7 +8345,7 @@ async def group_stata(message: Message):
                 SUM(CASE WHEN mode='no_hold' THEN 1 ELSE 0 END) AS no_hold_total,
                 SUM(COALESCE(charge_amount, price)) AS turnover_total
             FROM queue_items
-            WHERE charge_chat_id=? AND charge_thread_id=? AND taken_at>=? AND taken_at<?
+            WHERE charge_chat_id=? AND charge_thread_id=? AND ((taken_at>=? AND taken_at<?) OR status IN ({active_sql}))
             GROUP BY operator_key
             ORDER BY total DESC, operator_key ASC
             """,
@@ -8242,10 +8364,6 @@ async def group_stata(message: Message):
             f"⚠️ Ошибки: <b>{int(totals['errors'] or 0)}</b>",
             f"🏦 Оборот группы: <b>{usd(totals['turnover_total'] or 0)}</b>",
         ]
-        if role in {"chief_admin", "admin"}:
-            lines.extend([
-                f"🏦 Списано с казны: <b>{usd(totals['spent_total'] or 0)}</b>",
-            ])
         if per_operator:
             lines.append("")
             lines.append("<b>📱 По операторам</b>")
@@ -8257,121 +8375,8 @@ async def group_stata(message: Message):
                 )
         await message.answer("\n".join(lines))
     except Exception:
-        await message.answer("⚠️ Не удалось собрать статистику группы. Смотрите её через кнопку в /admin.")
-
-@router.callback_query(F.data == "admin:set_withdraw_channel")
-async def admin_set_withdraw_channel(callback: CallbackQuery, state: FSMContext):
-    if not is_chief_admin(callback.from_user.id):
-        await callback.answer("Только главный админ", show_alert=True)
-        return
-    await state.update_data(channel_target="withdraw_channel_id")
-    await state.set_state(AdminStates.waiting_channel_value)
-    current_value = escape(db.get_setting("withdraw_channel_id", str(WITHDRAW_CHANNEL_ID)))
-    await callback.message.answer(
-        "Введите новый <b>ID канала выплат</b>:\n"
-        f"Текущее значение: <code>{current_value}</code>"
-    )
-    await safe_callback_answer(callback)
-
-
-@router.callback_query(F.data == "admin:set_withdraw_topic")
-async def admin_set_withdraw_topic(callback: CallbackQuery, state: FSMContext):
-    if not is_chief_admin(callback.from_user.id):
-        await callback.answer("Только главный админ", show_alert=True)
-        return
-    await state.update_data(channel_target="withdraw_thread_id")
-    await state.set_state(AdminStates.waiting_channel_value)
-    current_value = escape(db.get_setting("withdraw_thread_id", "0"))
-    await callback.message.answer(
-        "Введите новый <b>ID топика выплат</b>:\n"
-        "Отправь <code>0</code>, чтобы отключить топик и слать выплаты просто в канал.\n"
-        f"Текущее значение: <code>{current_value}</code>"
-    )
-    await safe_callback_answer(callback)
-
-
-@router.callback_query(F.data == "admin:set_backup_channel")
-async def admin_set_backup_channel(callback: CallbackQuery, state: FSMContext):
-    if not is_chief_admin(callback.from_user.id):
-        await callback.answer("Только главный админ", show_alert=True)
-        return
-    await state.update_data(channel_target="backup_channel_id")
-    await state.set_state(AdminStates.waiting_channel_value)
-    current_value = escape(db.get_setting("backup_channel_id", "0"))
-    await callback.message.answer(
-        "Введите новый <b>ID канала автобэкапа</b>:\n"
-        f"Текущее значение: <code>{current_value}</code>"
-    )
-    await safe_callback_answer(callback)
-
-
-@router.callback_query(F.data == "admin:toggle_backup")
-async def admin_toggle_backup(callback: CallbackQuery):
-    if not is_chief_admin(callback.from_user.id):
-        await callback.answer("Только главный админ", show_alert=True)
-        return
-    enabled = not is_backup_enabled()
-    set_backup_enabled(enabled)
-    await safe_edit_or_send(callback, render_admin_settings(), reply_markup=settings_kb())
-    await callback.answer("Автовыгрузка включена" if enabled else "Автовыгрузка выключена")
-
-
-@router.callback_query(F.data == "admin:set_log_channel")
-async def admin_set_log_channel(callback: CallbackQuery, state: FSMContext):
-    if not is_chief_admin(callback.from_user.id):
-        await callback.answer("Только главный админ", show_alert=True)
-        return
-    await state.update_data(channel_target="log_channel_id")
-    await state.set_state(AdminStates.waiting_channel_value)
-    await callback.message.answer("Введите новый <b>ID канала логов</b>:")
-    await safe_callback_answer(callback)
-
-@router.callback_query(F.data == "admin:required_join_manage")
-async def admin_required_join_manage(callback: CallbackQuery):
-    if not is_chief_admin(callback.from_user.id):
-        await callback.answer("Только главный админ", show_alert=True)
-        return
-    await safe_edit_or_send(callback, render_required_join_admin(), reply_markup=required_join_manage_kb())
-    await safe_callback_answer(callback)
-
-@router.callback_query(F.data == "admin:required_join_add")
-async def admin_required_join_add(callback: CallbackQuery, state: FSMContext):
-    if not is_chief_admin(callback.from_user.id):
-        await callback.answer("Только главный админ", show_alert=True)
-        return
-    await state.set_state(AdminStates.waiting_required_join_item)
-    await callback.message.answer(
-        "Пришли новый канал в формате:\n"
-        "<code>-100xxxxxxxxxx | https://t.me/your_link | Название</code>\n\n"
-        "Название можно не указывать. Для отмены отправь <code>-</code>."
-    )
-    await safe_callback_answer(callback)
-
-@router.callback_query(F.data == "admin:required_join_remove")
-async def admin_required_join_remove(callback: CallbackQuery, state: FSMContext):
-    if not is_chief_admin(callback.from_user.id):
-        await callback.answer("Только главный админ", show_alert=True)
-        return
-    items = required_join_entries()
-    if not items:
-        await callback.answer("Список пуст", show_alert=True)
-        return
-    await state.set_state(AdminStates.waiting_required_join_remove)
-    lines = ["Что убрать? Отправь <b>номер из списка</b> или <b>ID канала</b>.", ""]
-    for idx, item in enumerate(items, 1):
-        title = escape(item.get("title") or f"Канал {idx}")
-        lines.append(f"{idx}. {title} — <code>{item['chat_id']}</code>")
-    await callback.message.answer("\n".join(lines))
-    await safe_callback_answer(callback)
-
-@router.callback_query(F.data == "admin:required_join_clear")
-async def admin_required_join_clear(callback: CallbackQuery):
-    if not is_chief_admin(callback.from_user.id):
-        await callback.answer("Только главный админ", show_alert=True)
-        return
-    save_required_join_entries([])
-    await safe_edit_or_send(callback, render_required_join_admin(), reply_markup=required_join_manage_kb())
-    await callback.answer("Список очищен")
+        logging.exception("group_stata failed chat_id=%s user_id=%s", message.chat.id, message.from_user.id)
+        await message.answer("❌ Не удалось открыть статистику.")
 
 @router.message(AdminStates.waiting_required_join_item)
 async def admin_required_join_item_value(message: Message, state: FSMContext):
@@ -8569,7 +8574,12 @@ async def track_any_message(message: Message):
 
 
 def cleanup_database_size(max_mb: int = 19):
-    """Сжимает живую bot.db до лимита за счёт удаления старых QR blob."""
+    """Сжимает bot.db, чтобы база не раздувалась от старых QR/blob.
+
+    Номера, операторы, история, статистика и file_id остаются.
+    Удаляются только тяжёлые qr_blob у старых закрытых заявок, когда база выше лимита.
+    Активные заявки и последние QR сохраняются.
+    """
     try:
         db_path = Path(DB_PATH)
         if not db_path.exists():
@@ -8579,88 +8589,66 @@ def cleanup_database_size(max_mb: int = 19):
             return
         logging.warning("DB cleanup started: %.2f MB > %s MB", before, max_mb)
 
-        active = ("queued", "taken", "in_progress", "waiting_check", "checking", "on_hold", "hold", "review", "check", "work", "processing")
-        active_sql = ",".join([f"'{x}'" for x in active])
-
-        def run(sql: str, label: str):
-            try:
-                cur = db.conn.execute(sql)
-                db.conn.commit()
-                db.conn.execute("VACUUM")
-                db.conn.commit()
-                logging.warning("DB cleanup step=%s rows=%s size=%.2fMB", label, cur.rowcount, db_path.stat().st_size / (1024 * 1024))
-            except Exception:
-                logging.exception("DB cleanup step failed: %s", label)
-
-        run(f"""
-            UPDATE queue_items
-               SET qr_blob=NULL, qr_mime=NULL, qr_filename=NULL
-             WHERE qr_blob IS NOT NULL
-               AND status NOT IN ({active_sql})
-               AND id NOT IN (
-                   SELECT id FROM queue_items
-                    WHERE qr_blob IS NOT NULL
-                    ORDER BY id DESC
-                    LIMIT 250
-               )
-        """, "closed_keep_250")
-
-        if db_path.stat().st_size / (1024 * 1024) > max_mb:
-            run(f"""
+        # Убираем blob только у старых закрытых заявок. qr_file_id/номер/оператор остаются.
+        try:
+            db.conn.execute("""
                 UPDATE queue_items
                    SET qr_blob=NULL, qr_mime=NULL, qr_filename=NULL
                  WHERE qr_blob IS NOT NULL
-                   AND status NOT IN ({active_sql})
+                   AND status IN ('completed','paid','failed','slipped','cancelled')
                    AND id NOT IN (
                        SELECT id FROM queue_items
                         WHERE qr_blob IS NOT NULL
-                        ORDER BY id DESC
-                        LIMIT 100
-                   )
-            """, "closed_keep_100")
-
-        if db_path.stat().st_size / (1024 * 1024) > max_mb:
-            run(f"""
-                UPDATE queue_items
-                   SET qr_blob=NULL, qr_mime=NULL, qr_filename=NULL
-                 WHERE qr_blob IS NOT NULL
-                   AND id NOT IN (
-                       SELECT id FROM queue_items
-                        WHERE qr_blob IS NOT NULL
-                          AND status IN ({active_sql})
                         ORDER BY id DESC
                         LIMIT 300
                    )
-                   AND id NOT IN (
-                       SELECT id FROM queue_items
-                        WHERE qr_blob IS NOT NULL
-                        ORDER BY id DESC
-                        LIMIT 30
-                   )
-            """, "active_plus_latest_30")
+            """)
+            db.conn.commit()
+        except Exception:
+            logging.exception("DB cleanup closed qr_blob cleanup failed")
 
-        if db_path.stat().st_size / (1024 * 1024) > max_mb:
-            run("""
-                UPDATE queue_items
-                   SET qr_blob=NULL, qr_mime=NULL, qr_filename=NULL
-                 WHERE qr_blob IS NOT NULL
-            """, "remove_all_blobs")
+        # Если всё ещё большая — оставляем активные + последние 150 blob.
+        try:
+            mid = db_path.stat().st_size / (1024 * 1024)
+            if mid > max_mb:
+                db.conn.execute("""
+                    UPDATE queue_items
+                       SET qr_blob=NULL, qr_mime=NULL, qr_filename=NULL
+                     WHERE qr_blob IS NOT NULL
+                       AND status NOT IN ('queued','taken','in_progress')
+                       AND id NOT IN (
+                           SELECT id FROM queue_items
+                            WHERE qr_blob IS NOT NULL
+                            ORDER BY id DESC
+                            LIMIT 150
+                       )
+                """)
+                db.conn.commit()
+        except Exception:
+            logging.exception("DB cleanup stronger qr_blob cleanup failed")
 
+        # Чистим возможные служебные логи, если такие таблицы есть.
         for table in ("logs", "event_logs", "admin_logs"):
             try:
-                db.conn.execute(f"DELETE FROM {table} WHERE id NOT IN (SELECT id FROM {table} ORDER BY id DESC LIMIT 3000)")
+                db.conn.execute(f"DELETE FROM {table} WHERE id NOT IN (SELECT id FROM {table} ORDER BY id DESC LIMIT 5000)")
                 db.conn.commit()
             except Exception:
                 pass
+
         try:
             db.conn.execute("VACUUM")
             db.conn.commit()
         except Exception:
-            pass
+            logging.exception("DB cleanup VACUUM failed")
+
         after = db_path.stat().st_size / (1024 * 1024)
         logging.warning("DB cleanup finished: %.2f MB -> %.2f MB", before, after)
     except Exception:
         logging.exception("cleanup_database_size failed")
+
+
+
+
 
 
 
@@ -8816,16 +8804,6 @@ async def adminclear_cmd(message: Message):
         "<code>/clearqueue</code> — убрать всё из очереди",
         reply_markup=admin_cleanup_queue_keyboard()
     )
-
-@router.message(Command("dbclean"))
-async def dbclean_cmd(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    before = Path(DB_PATH).stat().st_size / (1024 * 1024) if Path(DB_PATH).exists() else 0
-    cleanup_database_size(19)
-    after = Path(DB_PATH).stat().st_size / (1024 * 1024) if Path(DB_PATH).exists() else 0
-    await message.answer(f"✅ Очистка БД выполнена\n\nБыло: <b>{before:.2f} MB</b>\nСтало: <b>{after:.2f} MB</b>")
-
 
 async def main():
     global LIVE_DP, PRIMARY_BOT
