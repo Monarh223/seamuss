@@ -7204,6 +7204,79 @@ RESERVED_BOT_COMMANDS_FOR_DYNAMIC_STUB = {
 }
 
 @router.message(F.text.regexp(r"^/[A-Za-z0-9_]+(?:@\w+)?$"))
+
+@router.message(Command("stata"))
+@router.message(Command("stats"))
+async def group_stata(message: Message):
+    try:
+        if message.chat.type == ChatType.PRIVATE:
+            return await message.answer("❌ Команда работает только в группах.")
+
+        day_start, day_end, day_label = msk_today_bounds_str()
+
+        active_statuses = "'queued','taken','in_progress','waiting_check','checking','on_hold'"
+
+        total = db.conn.execute(
+            f"""
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS success,
+                SUM(CASE WHEN fail_reason='slip' THEN 1 ELSE 0 END) AS slips,
+                SUM(CASE WHEN fail_reason LIKE 'error%' THEN 1 ELSE 0 END) AS errors,
+                SUM(CASE WHEN taken_at IS NOT NULL THEN 1 ELSE 0 END) AS taken,
+                SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) ELSE 0 END) AS turnover
+            FROM queue_items
+            WHERE charge_chat_id=?
+              AND ((created_at>=? AND created_at<?) OR status IN ({active_statuses}))
+            """,
+            (message.chat.id, day_start, day_end),
+        ).fetchone()
+
+        operators = db.conn.execute(
+            f"""
+            SELECT
+                operator_key,
+                COUNT(*) AS total,
+                SUM(CASE WHEN mode='hold' THEN 1 ELSE 0 END) AS hold_total,
+                SUM(CASE WHEN mode='no_hold' THEN 1 ELSE 0 END) AS no_hold_total
+            FROM queue_items
+            WHERE charge_chat_id=?
+              AND ((created_at>=? AND created_at<?) OR status IN ({active_statuses}))
+            GROUP BY operator_key
+            ORDER BY total DESC
+            """,
+            (message.chat.id, day_start, day_end),
+        ).fetchall()
+
+        lines = [
+            "📊 <b>СТАТИСТИКА ГРУППЫ</b>",
+            f"🗓 День: <b>{day_label}</b>",
+            "",
+            f"📦 Всего: <b>{int(total['total'] or 0)}</b>",
+            f"🙋 Взято: <b>{int(total['taken'] or 0)}</b>",
+            f"✅ Успешно: <b>{int(total['success'] or 0)}</b>",
+            f"❌ Слеты: <b>{int(total['slips'] or 0)}</b>",
+            f"⚠️ Ошибки: <b>{int(total['errors'] or 0)}</b>",
+            f"🏦 Оборот: <b>{usd(total['turnover'] or 0)}</b>",
+        ]
+
+        if operators:
+            lines.append("")
+            lines.append("📱 <b>ПО ОПЕРАТОРАМ</b>")
+            for row in operators:
+                lines.append(
+                    f"• {op_text(row['operator_key'])}: "
+                    f"<b>{int(row['total'] or 0)}</b> "
+                    f"(⏳ {int(row['hold_total'] or 0)} / ⚡ {int(row['no_hold_total'] or 0)})"
+                )
+
+        await message.answer("\n".join(lines))
+
+    except Exception as e:
+        logging.exception("group_stata hard fail")
+        await message.answer(f"❌ Ошибка stata: <code>{escape(str(e))}</code>")
+
+
 async def dynamic_operator_command_stub(message: Message):
     raw_cmd_for_stub = ((message.text or "").split()[0]).split("@")[0].lower()
     if raw_cmd_for_stub in RESERVED_BOT_COMMANDS_FOR_DYNAMIC_STUB:
