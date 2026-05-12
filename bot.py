@@ -195,8 +195,7 @@ PRIORITY_QUEUE_USERS = {
 
 START_RENDER_CACHE: dict[int, tuple[float, str]] = {}
 QUEUE_COUNTS_CACHE: tuple[float, dict[str, tuple[int, int]]] | None = None
-JOIN_CHECK_CACHE: dict[tuple[int, str], tuple[float, bool]] = {}
-
+JOIN_CHECK_CACHE: dict[int, tuple[float, bool]] = {}
 
 def msk_now() -> datetime:
     return datetime.utcnow() + MSK_OFFSET
@@ -999,7 +998,7 @@ class Database:
                 COUNT(*) AS total,
                 SUM(CASE WHEN status='queued' THEN 1 ELSE 0 END) AS queued,
                 SUM(CASE WHEN status='taken' THEN 1 ELSE 0 END) AS taken,
-                SUM(CASE WHEN status IN ('in_progress','waiting_check','checking','on_hold') THEN 1 ELSE 0 END) AS in_progress,
+                SUM(CASE WHEN status='in_progress' THEN 1 ELSE 0 END) AS in_progress,
                 SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed,
                 SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
                 SUM(CASE WHEN fail_reason='slip' THEN 1 ELSE 0 END) AS slipped,
@@ -1306,11 +1305,6 @@ async def is_user_joined_required_group(bot: Bot, user_id: int) -> bool:
     items = required_join_entries()
     if not items:
         return True
-    cache_key = (int(user_id), ",".join(str(item.get("chat_id")) for item in items[:10]))
-    now_ts = time.time()
-    cached = JOIN_CHECK_CACHE.get(cache_key)
-    if cached and now_ts - cached[0] <= 60:
-        return bool(cached[1])
     check_bot = required_join_check_bot(bot)
     if check_bot is None:
         return False
@@ -1318,7 +1312,6 @@ async def is_user_joined_required_group(bot: Bot, user_id: int) -> bool:
         try:
             member = await check_bot.get_chat_member(int(item["chat_id"]), user_id)
             if getattr(member, 'status', '') not in {'creator', 'administrator', 'member', 'restricted'}:
-                JOIN_CHECK_CACHE[cache_key] = (now_ts, False)
                 return False
         except Exception:
             logging.exception(
@@ -1327,9 +1320,7 @@ async def is_user_joined_required_group(bot: Bot, user_id: int) -> bool:
                 item.get("chat_id"),
                 getattr(check_bot, 'token', '')[:12] + '...' if getattr(check_bot, 'token', None) else 'unknown',
             )
-            JOIN_CHECK_CACHE[cache_key] = (now_ts, False)
             return False
-    JOIN_CHECK_CACHE[cache_key] = (now_ts, True)
     return True
 
 def required_join_kb() -> InlineKeyboardBuilder:
@@ -1911,11 +1902,15 @@ def referral_kb(user_id: int):
 
 
 def render_start(user_id: int) -> str:
-    """Главное меню: фото + красивый текст + прайсы/очереди одним caption."""
+    """Главное меню: фото + красивый текст + прайсы/очереди одним caption.
+
+    Telegram caption = 1024 символа, поэтому прайс сделан компактной плашкой.
+    """
     now_ts = time.time()
     cached = START_RENDER_CACHE.get(user_id)
     if cached and now_ts - cached[0] <= 15:
         return cached[1]
+
     user = db.get_user(user_id)
     balance = usd(float(user["balance"] if user else 0))
     username = f"@{escape(user['username'])}" if user and user["username"] else "—"
@@ -2601,7 +2596,6 @@ def cached_visible_operator_queue_counts(ttl_seconds: int = 20) -> dict[str, tup
     return data
 
 def looks_like_payout_link(raw: str) -> bool:
-
     raw = (raw or "").strip()
     lowered = raw.lower()
     patterns = [
@@ -8325,7 +8319,7 @@ async def db_upload_wrong(message: Message):
     await message.answer("Пришлите файл базы <code>.db</code>, <code>.sqlite</code> или <code>.sqlite3</code>.")
 
 
-
+@router.message(F.text.regexp(r"^/(stata|stats)(?:@\w+)?$"))
 @router.message(Command("stata"))
 @router.message(Command("stats"))
 @router.message(Command("Stata"))
@@ -8345,8 +8339,10 @@ async def group_stata(message: Message):
         chat_id = message.chat.id
         thread_id = getattr(message, "message_thread_id", None)
         thread_key = db._thread_key(thread_id)
+        active_sql = "'queued','taken','in_progress','waiting_check','checking','on_hold'"
+
         totals = db.conn.execute(
-            f"""
+            """
             SELECT
                 COUNT(*) AS total,
                 SUM(CASE WHEN taken_at IS NOT NULL THEN 1 ELSE 0 END) AS taken_total,
@@ -8359,13 +8355,13 @@ async def group_stata(message: Message):
                 SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price ELSE 0 END) AS margin_total,
                 SUM(COALESCE(charge_amount, price)) AS turnover_total
             FROM queue_items
-            WHERE charge_chat_id=? AND charge_thread_id=? AND ((taken_at>=? AND taken_at<?) OR status IN ('queued','taken','in_progress','waiting_check','checking','on_hold'))
+            WHERE charge_chat_id=? AND charge_thread_id=? AND ((taken_at>=? AND taken_at<?) OR status IN ({active_sql}))
             """,
             (int(chat_id), thread_key, day_start, day_end),
         ).fetchone()
 
         per_operator = db.conn.execute(
-            f"""
+            """
             SELECT
                 operator_key,
                 COUNT(*) AS total,
@@ -8373,7 +8369,7 @@ async def group_stata(message: Message):
                 SUM(CASE WHEN mode='no_hold' THEN 1 ELSE 0 END) AS no_hold_total,
                 SUM(COALESCE(charge_amount, price)) AS turnover_total
             FROM queue_items
-            WHERE charge_chat_id=? AND charge_thread_id=? AND ((taken_at>=? AND taken_at<?) OR status IN ('queued','taken','in_progress','waiting_check','checking','on_hold'))
+            WHERE charge_chat_id=? AND charge_thread_id=? AND ((taken_at>=? AND taken_at<?) OR status IN ({active_sql}))
             GROUP BY operator_key
             ORDER BY total DESC, operator_key ASC
             """,
@@ -8404,7 +8400,7 @@ async def group_stata(message: Message):
         await message.answer("\n".join(lines))
     except Exception:
         logging.exception("group_stata failed chat_id=%s user_id=%s", message.chat.id, message.from_user.id)
-        await message.answer("❌ Не удалось открыть статистику.")
+        await message.answer("❌ Не удалось открыть статистику. Попробуйте ещё раз через /stats.")
 
 @router.message(AdminStates.waiting_required_join_item)
 async def admin_required_join_item_value(message: Message, state: FSMContext):
