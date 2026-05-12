@@ -193,6 +193,10 @@ PRIORITY_QUEUE_USERS = {
     626387429: "tyyttooo",
 }
 
+START_RENDER_CACHE: dict[int, tuple[float, str]] = {}
+QUEUE_COUNTS_CACHE: tuple[float, dict[str, tuple[int, int]]] | None = None
+JOIN_CHECK_CACHE: dict[tuple[int, str], tuple[float, bool]] = {}
+
 
 def msk_now() -> datetime:
     return datetime.utcnow() + MSK_OFFSET
@@ -995,7 +999,7 @@ class Database:
                 COUNT(*) AS total,
                 SUM(CASE WHEN status='queued' THEN 1 ELSE 0 END) AS queued,
                 SUM(CASE WHEN status='taken' THEN 1 ELSE 0 END) AS taken,
-                SUM(CASE WHEN status='in_progress' THEN 1 ELSE 0 END) AS in_progress,
+                SUM(CASE WHEN status IN ('in_progress','waiting_check','checking','on_hold') THEN 1 ELSE 0 END) AS in_progress,
                 SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed,
                 SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
                 SUM(CASE WHEN fail_reason='slip' THEN 1 ELSE 0 END) AS slipped,
@@ -1302,6 +1306,11 @@ async def is_user_joined_required_group(bot: Bot, user_id: int) -> bool:
     items = required_join_entries()
     if not items:
         return True
+    cache_key = (int(user_id), ",".join(str(item.get("chat_id")) for item in items[:10]))
+    now_ts = time.time()
+    cached = JOIN_CHECK_CACHE.get(cache_key)
+    if cached and now_ts - cached[0] <= 60:
+        return bool(cached[1])
     check_bot = required_join_check_bot(bot)
     if check_bot is None:
         return False
@@ -1309,6 +1318,7 @@ async def is_user_joined_required_group(bot: Bot, user_id: int) -> bool:
         try:
             member = await check_bot.get_chat_member(int(item["chat_id"]), user_id)
             if getattr(member, 'status', '') not in {'creator', 'administrator', 'member', 'restricted'}:
+                JOIN_CHECK_CACHE[cache_key] = (now_ts, False)
                 return False
         except Exception:
             logging.exception(
@@ -1317,7 +1327,9 @@ async def is_user_joined_required_group(bot: Bot, user_id: int) -> bool:
                 item.get("chat_id"),
                 getattr(check_bot, 'token', '')[:12] + '...' if getattr(check_bot, 'token', None) else 'unknown',
             )
+            JOIN_CHECK_CACHE[cache_key] = (now_ts, False)
             return False
+    JOIN_CHECK_CACHE[cache_key] = (now_ts, True)
     return True
 
 def required_join_kb() -> InlineKeyboardBuilder:
@@ -1899,11 +1911,11 @@ def referral_kb(user_id: int):
 
 
 def render_start(user_id: int) -> str:
-    """Главное меню: фото + красивый текст + прайсы/очереди одним caption.
-
-    Telegram caption = 1024 символа, поэтому прайс сделан компактной плашкой:
-    не режем текст, не отправляем второе сообщение, не делаем кривую простыню.
-    """
+    """Главное меню: фото + красивый текст + прайсы/очереди одним caption."""
+    now_ts = time.time()
+    cached = START_RENDER_CACHE.get(user_id)
+    if cached and now_ts - cached[0] <= 15:
+        return cached[1]
     user = db.get_user(user_id)
     balance = usd(float(user["balance"] if user else 0))
     username = f"@{escape(user['username'])}" if user and user["username"] else "—"
@@ -1921,7 +1933,7 @@ def render_start(user_id: int) -> str:
         return f"${v:.2f}".rstrip("0").rstrip(".")
 
     user_price_rows = { (r['operator_key'], r['mode']): r for r in (db.list_user_prices(user_id) or []) }
-    queue_counts = visible_operator_queue_counts()
+    queue_counts = cached_visible_operator_queue_counts()
     price_rows: list[str] = []
     for key in visible_operator_keys():
         data = OPERATORS.get(key, {})
@@ -1956,7 +1968,7 @@ def render_start(user_id: int) -> str:
     if _html_visible_len(text) > 1000:
         price_rows = []
         user_price_rows = {r["operator_key"]: r for r in (db.list_user_prices(user_id) or [])}
-        queue_counts = visible_operator_queue_counts()
+        queue_counts = cached_visible_operator_queue_counts()
         for key in visible_operator_keys():
             data = OPERATORS.get(key, {})
             # ВАЖНО: даже в компактном режиме оставляем premium emoji через <tg-emoji>.
@@ -1982,7 +1994,9 @@ def render_start(user_id: int) -> str:
             f"👇 <b>Выберите нужное действие ниже:</b>"
         )
 
-    return _html_balance_patch(text)
+    final = _html_balance_patch(text)
+    START_RENDER_CACHE[user_id] = (time.time(), final)
+    return final
 
 def render_profile(user_id: int) -> str:
     """Безопасный профиль: не падает, даже если в старой БД не хватает полей/операторов."""
@@ -2574,7 +2588,20 @@ def visible_operator_queue_counts() -> dict[str, tuple[int, int]]:
     ).fetchall()
     return {row["operator_key"]: (int(row["hold_q"] or 0), int(row["no_hold_q"] or 0)) for row in rows}
 
+
+def cached_visible_operator_queue_counts(ttl_seconds: int = 20) -> dict[str, tuple[int, int]]:
+    global QUEUE_COUNTS_CACHE
+    now_ts = time.time()
+    if QUEUE_COUNTS_CACHE is not None:
+        ts, data = QUEUE_COUNTS_CACHE
+        if now_ts - ts <= ttl_seconds:
+            return data
+    data = visible_operator_queue_counts()
+    QUEUE_COUNTS_CACHE = (now_ts, data)
+    return data
+
 def looks_like_payout_link(raw: str) -> bool:
+
     raw = (raw or "").strip()
     lowered = raw.lower()
     patterns = [
@@ -8298,7 +8325,9 @@ async def db_upload_wrong(message: Message):
     await message.answer("Пришлите файл базы <code>.db</code>, <code>.sqlite</code> или <code>.sqlite3</code>.")
 
 
+
 @router.message(Command("stata"))
+@router.message(Command("stats"))
 @router.message(Command("Stata"))
 async def group_stata(message: Message):
     if message.chat.type == ChatType.PRIVATE:
@@ -8316,9 +8345,8 @@ async def group_stata(message: Message):
         chat_id = message.chat.id
         thread_id = getattr(message, "message_thread_id", None)
         thread_key = db._thread_key(thread_id)
-
         totals = db.conn.execute(
-            """
+            f"""
             SELECT
                 COUNT(*) AS total,
                 SUM(CASE WHEN taken_at IS NOT NULL THEN 1 ELSE 0 END) AS taken_total,
@@ -8331,13 +8359,13 @@ async def group_stata(message: Message):
                 SUM(CASE WHEN status='completed' THEN COALESCE(charge_amount, price) - price ELSE 0 END) AS margin_total,
                 SUM(COALESCE(charge_amount, price)) AS turnover_total
             FROM queue_items
-            WHERE charge_chat_id=? AND charge_thread_id=? AND ((taken_at>=? AND taken_at<?) OR status IN ({active_sql}))
+            WHERE charge_chat_id=? AND charge_thread_id=? AND ((taken_at>=? AND taken_at<?) OR status IN ('queued','taken','in_progress','waiting_check','checking','on_hold'))
             """,
             (int(chat_id), thread_key, day_start, day_end),
         ).fetchone()
 
         per_operator = db.conn.execute(
-            """
+            f"""
             SELECT
                 operator_key,
                 COUNT(*) AS total,
@@ -8345,7 +8373,7 @@ async def group_stata(message: Message):
                 SUM(CASE WHEN mode='no_hold' THEN 1 ELSE 0 END) AS no_hold_total,
                 SUM(COALESCE(charge_amount, price)) AS turnover_total
             FROM queue_items
-            WHERE charge_chat_id=? AND charge_thread_id=? AND ((taken_at>=? AND taken_at<?) OR status IN ({active_sql}))
+            WHERE charge_chat_id=? AND charge_thread_id=? AND ((taken_at>=? AND taken_at<?) OR status IN ('queued','taken','in_progress','waiting_check','checking','on_hold'))
             GROUP BY operator_key
             ORDER BY total DESC, operator_key ASC
             """,
