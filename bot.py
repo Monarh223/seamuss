@@ -327,14 +327,52 @@ class Database:
                 self.conn.commit()
             except Exception:
                 pass
-            shutil.copyfile(current_path, backup_path)
+            try:
+                shutil.copyfile(current_path, backup_path)
+            except Exception:
+                logging.exception("failed to create DB backup before merge")
         try:
-            self.conn.close()
+            self.conn.commit()
         except Exception:
             pass
-        shutil.move(str(temp_uploaded), self.path)
-        self.conn = sqlite3.connect(self.path)
-        self.conn.row_factory = sqlite3.Row
+
+        # Safe merge: keep current DB as the source of truth and import only missing rows
+        # from the uploaded DB. This preserves prices/settings/manual edits already present.
+        try:
+            self.conn.execute("ATTACH DATABASE ? AS uploaded", (str(temp_uploaded),))
+            merge_tables = [
+                "users",
+                "roles",
+                "workspaces",
+                "queue_items",
+                "settings",
+                "custom_operators",
+                "group_finance",
+                "group_operator_prices",
+                "withdrawals",
+                "payout_accounts",
+                "mirrors",
+                "user_prices",
+            ]
+            for table in merge_tables:
+                try:
+                    self.conn.execute(f"INSERT OR IGNORE INTO main.{table} SELECT * FROM uploaded.{table}")
+                except Exception:
+                    logging.exception("merge table failed: %s", table)
+            try:
+                self.conn.commit()
+            except Exception:
+                pass
+            try:
+                self.conn.execute("DETACH DATABASE uploaded")
+            except Exception:
+                pass
+        finally:
+            try:
+                temp_uploaded.unlink(missing_ok=True)
+            except Exception:
+                pass
+
         self.create_tables()
         self.seed_defaults()
         try:
@@ -3800,7 +3838,7 @@ async def notify_user(bot: Bot, user_id: int, text: str):
 
 
 
-def make_compact_db_copy(max_mb: int = 19) -> Path | None:
+def make_compact_db_copy(max_mb: int = 18) -> Path | None:
     """Create a compact export copy of current DB without replacing live DB.
 
     This is for emergency cases when live bot.db is too large to export via Telegram.
@@ -4006,7 +4044,7 @@ def normalize_active_statuses_after_db_upload() -> int:
 async def send_compact_db_export(message: Message):
     if not is_admin(message.from_user.id):
         return
-    path = make_compact_db_copy(19)
+    path = make_compact_db_copy(18)
     if not path or not path.exists():
         await message.answer("❌ Не удалось сделать облегчённую копию БД.")
         return
@@ -8375,7 +8413,7 @@ async def db_upload_receive(message: Message, state: FSMContext, bot: Bot):
         ensure_extra_schema()
         restore_operators_from_db_anywhere()
         logging.info('DB upload post-restore operators: %s', sorted(OPERATORS.keys()))
-        cleanup_database_size(19)
+        cleanup_database_size(18)
     except Exception:
         logging.exception("db_upload_receive failed")
         temp_path.unlink(missing_ok=True)
@@ -8670,7 +8708,7 @@ async def track_any_message(message: Message):
 
 
 
-def cleanup_database_size(max_mb: int = 19):
+def cleanup_database_size(max_mb: int = 18):
     """Сжимает bot.db, чтобы база не раздувалась от старых QR/blob.
 
     Номера, операторы, история, статистика и file_id остаются.
@@ -8833,7 +8871,7 @@ async def admin_dbcompact_callback(callback: CallbackQuery):
         await safe_callback_answer(callback, "Нет доступа")
         return
     await safe_callback_answer(callback, "Готовлю облегчённую копию БД...")
-    path = make_compact_db_copy(19)
+    path = make_compact_db_copy(18)
     if not path or not path.exists():
         await callback.message.answer("❌ Не удалось сделать облегчённую копию БД.")
         return
@@ -8936,7 +8974,7 @@ async def main():
             continue
         await start_live_mirror(token)
 
-    cleanup_database_size(19)
+    cleanup_database_size(18)
     await dp.start_polling(primary_bot)
 
 
