@@ -336,29 +336,34 @@ class Database:
         except Exception:
             pass
 
-        # Safe merge: keep current DB as the source of truth and import only missing rows
-        # from the uploaded DB. This preserves prices/settings/manual edits already present.
+        # Safe merge: keep current DB settings/prices, but replace operational rows
+        # from the uploaded DB so the newest queue/users/stats data lands in main.
         try:
             self.conn.execute("ATTACH DATABASE ? AS uploaded", (str(temp_uploaded),))
-            merge_tables = [
+            replace_tables = [
                 "users",
                 "roles",
                 "workspaces",
                 "queue_items",
-                "settings",
-                "custom_operators",
                 "group_finance",
-                "group_operator_prices",
                 "withdrawals",
                 "payout_accounts",
                 "mirrors",
-                "user_prices",
             ]
-            for table in merge_tables:
+            keep_tables = [
+                "settings",
+                "custom_operators",
+                "group_operator_prices",
+                "user_prices",
+                "treasury_invoices",
+            ]
+            for table in replace_tables:
                 try:
-                    self.conn.execute(f"INSERT OR IGNORE INTO main.{table} SELECT * FROM uploaded.{table}")
+                    self.conn.execute(f"INSERT OR REPLACE INTO main.{table} SELECT * FROM uploaded.{table}")
                 except Exception:
-                    logging.exception("merge table failed: %s", table)
+                    logging.exception("replace merge table failed: %s", table)
+            # keep_tables are intentionally not overwritten to preserve prices and settings.
+            # If the uploaded DB has any new missing rows in those tables, schema defaults cover them.
             try:
                 self.conn.commit()
             except Exception:
