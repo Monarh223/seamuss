@@ -119,6 +119,24 @@ DEFAULT_GROUP_PRICES = {
 }
 BASE_OPERATOR_KEYS = set(OPERATORS.keys())
 PERMANENT_OPERATOR_CONFIG = {k: dict(v) for k, v in OPERATORS.items()}
+
+PERMANENT_OPERATOR_PRICES = {
+    "mts": {"hold": 18.0, "no_hold": 15.0},
+    "mtssalon": {"hold": 18.0, "no_hold": 18.0},
+    "bil": {"hold": 17.0, "no_hold": 14.0},
+    "bilsalon": {"hold": 17.0, "no_hold": 16.0},
+    "tele2": {"hold": 14.0, "no_hold": 13.0},
+    "sber": {"hold": 12.0, "no_hold": 12.0},
+    "megafon": {"hold": 10.0, "no_hold": 10.0},
+    "vtb": {"hold": 22.0, "no_hold": 22.0},
+    "gazprom": {"hold": 30.0, "no_hold": 30.0},
+    "miranda": {"hold": 19.0, "no_hold": 19.0},
+    "dobrosvyz": {"hold": 12.0, "no_hold": 12.0},
+}
+
+for _op_key, _prices in PERMANENT_OPERATOR_PRICES.items():
+    if _op_key in PERMANENT_OPERATOR_CONFIG:
+        PERMANENT_OPERATOR_CONFIG[_op_key]["price"] = float(_prices["hold"])
 PERMANENT_OPERATOR_KEYS = set(PERMANENT_OPERATOR_CONFIG.keys())
 ACTIVE_OPERATOR_KEYS = set(PERMANENT_OPERATOR_CONFIG.keys())
 OPERATOR_KEY_ALIASES = {
@@ -330,19 +348,50 @@ class Database:
             try:
                 shutil.copyfile(current_path, backup_path)
             except Exception:
-                logging.exception("failed to create DB backup before replace")
+                logging.exception("failed to create DB backup before merge")
         try:
-            self.conn.close()
-        except Exception:
-            pass
-
-        # IMPORTANT:
-        # Uploaded DB is treated as the source of truth.
-        # We fully replace current bot.db with the uploaded file so prices/settings/statistics
-        # stay exactly as they are inside the uploaded database.
-        shutil.move(str(temp_uploaded), self.path)
-        self.conn = sqlite3.connect(self.path)
-        self.conn.row_factory = sqlite3.Row
+            self.conn.execute("ATTACH DATABASE ? AS uploaded", (str(temp_uploaded),))
+            self.conn.execute("PRAGMA foreign_keys=OFF")
+            # Preserve local settings/prices; merge only missing rows from uploaded DB.
+            # This keeps old statistics/settings and adds fresh queue/users/withdrawals when present.
+            tables_to_merge = [
+                "users",
+                "queue_items",
+                "withdrawals",
+                "mirrors",
+                "payout_accounts",
+                "workspaces",
+                "treasury_invoices",
+                "group_finance",
+                "settings",
+                "custom_operators",
+                "group_operator_prices",
+                "user_prices",
+                "roles",
+            ]
+            for table in tables_to_merge:
+                try:
+                    main_cols = [r[1] for r in self.conn.execute(f"PRAGMA main.table_info({table})").fetchall()]
+                    up_cols = [r[1] for r in self.conn.execute(f"PRAGMA uploaded.table_info({table})").fetchall()]
+                    common = [c for c in main_cols if c in up_cols]
+                    if not common:
+                        continue
+                    cols_sql = ",".join(common)
+                    self.conn.execute(
+                        f"INSERT OR IGNORE INTO main.{table} ({cols_sql}) SELECT {cols_sql} FROM uploaded.{table}"
+                    )
+                except Exception:
+                    logging.exception("merge table failed: %s", table)
+            self.conn.commit()
+        finally:
+            try:
+                self.conn.execute("DETACH DATABASE uploaded")
+            except Exception:
+                pass
+            try:
+                temp_uploaded.unlink(missing_ok=True)
+            except Exception:
+                pass
 
         # Make sure schema exists for any missing tables/columns, but do not overwrite data.
         self.create_tables()
@@ -563,12 +612,11 @@ class Database:
         for key, value in defaults.items():
             self.conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, value))
         for key, data in OPERATORS.items():
-            self.conn.execute(
-                "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
-                (f"price_{key}", str(data["price"])),
-            )
-            self.conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (f"allow_hold_{key}", "1"))
-            self.conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (f"allow_no_hold_{key}", "1"))
+            hold_price = float(PERMANENT_OPERATOR_PRICES.get(key, {}).get("hold", data["price"]))
+            no_hold_price = float(PERMANENT_OPERATOR_PRICES.get(key, {}).get("no_hold", data["price"]))
+            self.conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (f"price_{key}", str(hold_price)))
+            self.conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (f"price_hold_{key}", str(hold_price)))
+            self.conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (f"price_no_hold_{key}", str(no_hold_price)))
             self.conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (f"allow_hold_{key}", "1"))
             self.conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (f"allow_no_hold_{key}", "1"))
         self.conn.execute(
@@ -2849,7 +2897,7 @@ def load_extra_operators_from_settings():
             if not key or key in OPERATORS or key in items_by_key:
                 continue
             title = db.get_setting(f'operator_title_{key}', key.upper())
-            price_raw = db.get_setting(f'price_{key}', None)
+            price_raw = db.get_setting(f'price_hold_{key}', db.get_setting(f'price_no_hold_{key}', db.get_setting(f'price_{key}', None)))
             if price_raw is None:
                 pr = db.conn.execute("SELECT price FROM queue_items WHERE operator_key=? AND price IS NOT NULL ORDER BY id DESC LIMIT 1", (key,)).fetchone()
                 price_raw = str(pr['price'] if pr and pr['price'] is not None else 0)
@@ -2996,8 +3044,10 @@ def get_mode_price(operator_key: str, mode: str, user_id: int | None = None) -> 
         custom = db.get_user_price(user_id, operator_key, mode)
         if custom is not None:
             return float(custom)
-    default_price = float(PERMANENT_OPERATOR_CONFIG.get(operator_key, OPERATORS.get(operator_key, {})).get('price', 0) or 0)
-    legacy = db.get_setting(f"price_{operator_key}", str(default_price))
+    permanent_default = PERMANENT_OPERATOR_PRICES.get(operator_key, {}).get(mode)
+    if permanent_default is None:
+        permanent_default = float(PERMANENT_OPERATOR_CONFIG.get(operator_key, OPERATORS.get(operator_key, {})).get('price', 0) or 0)
+    legacy = db.get_setting(f"price_{operator_key}", str(permanent_default))
     return float(db.get_setting(f"price_{mode}_{operator_key}", legacy))
 
 
@@ -3491,13 +3541,14 @@ def enforce_permanent_operators():
     for key, data in PERMANENT_OPERATOR_CONFIG.items():
         title = data["title"]
         command = data["command"]
-        price = float(data["price"])
-        OPERATORS[key] = {"title": title, "price": price, "command": command}
+        hold_price = float(PERMANENT_OPERATOR_PRICES.get(key, {}).get("hold", data["price"]))
+        no_hold_price = float(PERMANENT_OPERATOR_PRICES.get(key, {}).get("no_hold", data["price"]))
+        OPERATORS[key] = {"title": title, "price": hold_price, "command": command}
         db.set_setting(f"operator_title_{key}", title)
         db.set_setting(f"operator_command_{key}", command)
-        db.set_setting(f"price_{key}", str(price))
-        db.set_setting(f"price_hold_{key}", str(price))
-        db.set_setting(f"price_no_hold_{key}", str(price))
+        db.set_setting(f"price_{key}", str(hold_price))
+        db.set_setting(f"price_hold_{key}", str(hold_price))
+        db.set_setting(f"price_no_hold_{key}", str(no_hold_price))
         if db.get_setting(f"operator_emoji_{key}", None) is None:
             emoji_id, emoji = CUSTOM_OPERATOR_EMOJI.get(key, ("", "📱"))
             db.set_setting(f"operator_emoji_id_{key}", emoji_id or "")
@@ -3515,7 +3566,8 @@ def seed_permanent_operators_to_db():
         for key, data in PERMANENT_OPERATOR_CONFIG.items():
             title = data.get("title", key)
             command = data.get("command", f"/{key}")
-            price = float(data.get("price", 0) or 0)
+            hold_price = float(PERMANENT_OPERATOR_PRICES.get(key, {}).get("hold", data.get("price", 0) or 0))
+            no_hold_price = float(PERMANENT_OPERATOR_PRICES.get(key, {}).get("no_hold", data.get("price", 0) or 0))
             emoji_id, emoji = CUSTOM_OPERATOR_EMOJI.get(key, (db.get_setting(f"operator_emoji_id_{key}", ""), db.get_setting(f"operator_emoji_{key}", "📱")))
             db.conn.execute("""
                 INSERT INTO custom_operators(key,title,price,command,emoji_id,emoji,is_deleted,updated_at)
@@ -3526,12 +3578,12 @@ def seed_permanent_operators_to_db():
                     command=excluded.command,
                     is_deleted=0,
                     updated_at=excluded.updated_at
-            """, (key, title, price, command, emoji_id or "", emoji or "📱", now_str()))
+            """, (key, title, hold_price, command, emoji_id or "", emoji or "📱", now_str()))
             db.set_setting(f"operator_title_{key}", title)
             db.set_setting(f"operator_command_{key}", command)
-            db.set_setting(f"price_{key}", str(price))
-            db.set_setting(f"price_hold_{key}", str(price))
-            db.set_setting(f"price_no_hold_{key}", str(price))
+            db.set_setting(f"price_{key}", str(hold_price))
+            db.set_setting(f"price_hold_{key}", str(hold_price))
+            db.set_setting(f"price_no_hold_{key}", str(no_hold_price))
             if db.get_setting(f"operator_emoji_id_{key}", None) is None:
                 db.set_setting(f"operator_emoji_id_{key}", emoji_id or "")
             if db.get_setting(f"operator_emoji_{key}", None) is None:
