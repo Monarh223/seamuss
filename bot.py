@@ -126,6 +126,7 @@ PERMANENT_OPERATOR_PRICES = {
     "bil": {"hold": 17.0, "no_hold": 14.0},
     "bilsalon": {"hold": 17.0, "no_hold": 16.0},
     "tele2": {"hold": 14.0, "no_hold": 13.0},
+    "tele2salon": {"hold": 15.0, "no_hold": 15.0},
     "sber": {"hold": 12.0, "no_hold": 12.0},
     "megafon": {"hold": 10.0, "no_hold": 10.0},
     "vtb": {"hold": 22.0, "no_hold": 22.0},
@@ -135,6 +136,7 @@ PERMANENT_OPERATOR_PRICES = {
 }
 
 for _op_key, _prices in PERMANENT_OPERATOR_PRICES.items():
+
     if _op_key in PERMANENT_OPERATOR_CONFIG:
         PERMANENT_OPERATOR_CONFIG[_op_key]["price"] = float(_prices["hold"])
 PERMANENT_OPERATOR_KEYS = set(PERMANENT_OPERATOR_CONFIG.keys())
@@ -352,9 +354,8 @@ class Database:
         try:
             self.conn.execute("ATTACH DATABASE ? AS uploaded", (str(temp_uploaded),))
             self.conn.execute("PRAGMA foreign_keys=OFF")
-            # Preserve local settings/prices; merge only missing rows from uploaded DB.
-            # This keeps old statistics/settings and adds fresh queue/users/withdrawals when present.
-            tables_to_merge = [
+            # Dynamic data comes from uploaded DB, static settings/prices remain local.
+            dynamic_tables = [
                 "users",
                 "queue_items",
                 "withdrawals",
@@ -363,14 +364,10 @@ class Database:
                 "workspaces",
                 "treasury_invoices",
                 "group_finance",
-                "settings",
-                "custom_operators",
-                "group_operator_prices",
-                "user_prices",
-                "roles",
             ]
-            for table in tables_to_merge:
+            for table in dynamic_tables:
                 try:
+                    self.conn.execute(f"DELETE FROM main.{table}")
                     main_cols = [r[1] for r in self.conn.execute(f"PRAGMA main.table_info({table})").fetchall()]
                     up_cols = [r[1] for r in self.conn.execute(f"PRAGMA uploaded.table_info({table})").fetchall()]
                     common = [c for c in main_cols if c in up_cols]
@@ -382,6 +379,9 @@ class Database:
                     )
                 except Exception:
                     logging.exception("merge table failed: %s", table)
+
+            # Do NOT overwrite static tables from uploaded:
+            # settings, custom_operators, group_operator_prices, user_prices, roles
             self.conn.commit()
         finally:
             try:
@@ -393,7 +393,6 @@ class Database:
             except Exception:
                 pass
 
-        # Make sure schema exists for any missing tables/columns, but do not overwrite data.
         self.create_tables()
         self.seed_defaults()
         try:
@@ -606,8 +605,13 @@ class Database:
             "start_subtitle": "Премиум сервис приёма номеров",
             "start_description": "🚀 <b>Быстрый приём заявок</b> • 💎 <b>Стабильные выплаты</b> • 🛡 <b>Контроль статусов</b>",
             "announcement_text": "",
+            "withdraw_channel_id": str(WITHDRAW_CHANNEL_ID),
+            "withdraw_thread_id": "0",
+            "log_channel_id": str(LOG_CHANNEL_ID),
             "backup_channel_id": "0",
             "backup_enabled": "0",
+            "required_join_chat_id": "0",
+            "required_join_link": "",
         }
         for key, value in defaults.items():
             self.conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, value))
@@ -617,8 +621,8 @@ class Database:
             self.conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (f"price_{key}", str(hold_price)))
             self.conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (f"price_hold_{key}", str(hold_price)))
             self.conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (f"price_no_hold_{key}", str(no_hold_price)))
-            self.conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (f"allow_hold_{key}", "1"))
-            self.conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (f"allow_no_hold_{key}", "1"))
+            self.conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (f"allow_hold_{key}", "1"))
+            self.conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (f"allow_no_hold_{key}", "1"))
         self.conn.execute(
             "INSERT OR IGNORE INTO roles (user_id, role, assigned_at) VALUES (?, 'chief_admin', ?)",
             (CHIEF_ADMIN_ID, now_str()),
@@ -1228,6 +1232,13 @@ def backup_channel_id() -> int:
         return int(db.get_setting("backup_channel_id", "0") or 0)
     except Exception:
         return 0
+
+def log_channel_id() -> int:
+    try:
+        return int(db.get_setting("log_channel_id", str(LOG_CHANNEL_ID)) or 0)
+    except Exception:
+        return 0
+
 
 
 def normalize_phone(raw: str) -> Optional[str]:
@@ -2493,6 +2504,17 @@ def settings_kb():
     kb.adjust(2)
     return kb.as_markup()
 
+
+async def ask_admin_channel_setting(callback: CallbackQuery, state: FSMContext, setting_key: str, label: str):
+    await state.set_state(AdminStates.waiting_channel_value)
+    await state.update_data(channel_target=setting_key)
+    await callback.message.answer(
+        f"{label}\n\n"
+        "Отправьте <b>ID канала числом</b>.\n"
+        "Для очистки отправьте <code>0</code>."
+    )
+    await safe_callback_answer(callback)
+
 def required_join_manage_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="➕ Добавить канал", callback_data="admin:required_join_add")
@@ -3588,7 +3610,7 @@ def seed_permanent_operators_to_db():
                 db.set_setting(f"operator_emoji_id_{key}", emoji_id or "")
             if db.get_setting(f"operator_emoji_{key}", None) is None:
                 db.set_setting(f"operator_emoji_{key}", emoji or "📱")
-            OPERATORS[key] = {"title": title, "price": price, "command": command}
+            OPERATORS[key] = {"title": title, "price": hold_price, "command": command}
             CUSTOM_OPERATOR_EMOJI[key] = (emoji_id or "", emoji or "📱")
         for row in db.conn.execute("SELECT key FROM custom_operators").fetchall():
             k = str(row['key'])
@@ -4096,19 +4118,20 @@ async def send_db_backup(bot: Bot, reason: str = "auto"):
     if not db_path.exists():
         logging.warning("DB backup skipped: DB file not found")
         return False
-    backup_dir = Path("db_backups")
-    backup_dir.mkdir(exist_ok=True)
-    stamp = msk_now().strftime("%Y%m%d_%H%M%S")
-    target = backup_dir / f"botdb_{reason}_{stamp}.db"
     try:
-        target.write_bytes(db_path.read_bytes())
+        cleanup_database_size(18)
+        compact = make_compact_db_copy(18)
+        target_path = Path(compact) if compact and Path(compact).exists() else db_path
+        size_mb = target_path.stat().st_size / (1024 * 1024)
         caption = (
             "<b>🗄 Автовыгрузка базы данных</b>\n\n"
             f"🕒 {escape(now_str())}\n"
-            f"🔖 Причина: <b>{escape(reason)}</b>"
+            f"🔖 Причина: <b>{escape(reason)}</b>\n"
+            f"📦 Размер: <b>{size_mb:.2f} MB</b>\n\n"
+            "Отправлена компактная копия БД."
         )
-        await bot.send_document(channel_id, FSInputFile(str(target)), caption=caption)
-        logging.info("DB backup sent to %s (%s)", channel_id, reason)
+        await bot.send_document(channel_id, FSInputFile(str(target_path)), caption=caption)
+        logging.info("DB backup sent to %s (%s) file=%s size=%.2fMB", channel_id, reason, target_path, size_mb)
         return True
     except Exception:
         logging.exception("send_db_backup failed")
@@ -4125,7 +4148,7 @@ async def backup_watcher(bot: Bot):
 
 async def send_log(bot: Bot, text: str):
     logging.info(re.sub(r"<[^>]+>", "", text))
-    channel_id = int(db.get_setting("log_channel_id", str(LOG_CHANNEL_ID) or "0") or 0)
+    channel_id = log_channel_id()
     if channel_id:
         try:
             await bot.send_message(channel_id, text)
@@ -5111,6 +5134,43 @@ async def admin_settings(callback: CallbackQuery):
     await safe_edit_or_send(callback, render_admin_settings(), reply_markup=settings_kb())
     await safe_callback_answer(callback)
 
+
+@router.callback_query(F.data == "admin:set_withdraw_channel")
+async def admin_set_withdraw_channel(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await ask_admin_channel_setting(callback, state, "withdraw_channel_id", "💳 <b>Канал выплат</b>")
+
+
+@router.callback_query(F.data == "admin:set_withdraw_topic")
+async def admin_set_withdraw_topic(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await ask_admin_channel_setting(callback, state, "withdraw_thread_id", "🧵 <b>Топик выплат</b>")
+
+
+@router.callback_query(F.data == "admin:set_log_channel")
+async def admin_set_log_channel(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await ask_admin_channel_setting(callback, state, "log_channel_id", "🧾 <b>Канал логов</b>")
+
+
+@router.callback_query(F.data == "admin:set_backup_channel")
+async def admin_set_backup_channel(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await ask_admin_channel_setting(callback, state, "backup_channel_id", "🗄 <b>Канал автобэкапа</b>")
+
+
+@router.callback_query(F.data == "admin:toggle_backup")
+async def admin_toggle_backup(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    enabled = not is_backup_enabled()
+    set_backup_enabled(enabled)
+    await safe_edit_or_send(callback, render_admin_settings(), reply_markup=settings_kb())
+    await callback.answer("Автовыгрузка включена" if enabled else "Автовыгрузка выключена")
 
 
 @router.callback_query(F.data == "admin:operator_modes")
@@ -8611,18 +8671,32 @@ async def admin_required_join_link_value(message: Message, state: FSMContext):
 
 @router.message(AdminStates.waiting_channel_value)
 async def admin_channel_value(message: Message, state: FSMContext):
-    if user_role(message.from_user.id) != "chief_admin":
+    if not is_admin(message.from_user.id):
         await state.clear()
         return
-    raw = message.text.strip()
-    if not raw.lstrip("-").isdigit():
-        await message.answer("Введите ID канала числом.")
+    raw = (message.text or "").strip()
+    if raw in {"0", "-", "clear", "off", "none"}:
+        raw = "0"
+    elif not raw.lstrip("-").isdigit():
+        await message.answer("Введите ID канала числом. Для очистки отправьте <code>0</code>.")
         return
     data = await state.get_data()
     key = data.get("channel_target")
+    if key not in {"withdraw_channel_id", "withdraw_thread_id", "log_channel_id", "backup_channel_id"}:
+        await state.clear()
+        await message.answer("❌ Неизвестная настройка.")
+        return
     db.set_setting(key, raw)
+    if key == "backup_channel_id" and raw == "0":
+        db.set_setting("backup_enabled", "0")
     await state.clear()
-    await message.answer("✅ Сохранено.")
+    pretty = {
+        "withdraw_channel_id": "Канал выплат",
+        "withdraw_thread_id": "Топик выплат",
+        "log_channel_id": "Канал логов",
+        "backup_channel_id": "Канал автобэкапа",
+    }.get(key, key)
+    await message.answer(f"✅ <b>{pretty}</b> сохранён: <code>{escape(raw)}</code>", reply_markup=admin_back_kb())
 
 
 
