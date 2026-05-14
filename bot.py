@@ -330,54 +330,21 @@ class Database:
             try:
                 shutil.copyfile(current_path, backup_path)
             except Exception:
-                logging.exception("failed to create DB backup before merge")
+                logging.exception("failed to create DB backup before replace")
         try:
-            self.conn.commit()
+            self.conn.close()
         except Exception:
             pass
 
-        # Safe merge: keep current DB settings/prices, but replace operational rows
-        # from the uploaded DB so the newest queue/users/stats data lands in main.
-        try:
-            self.conn.execute("ATTACH DATABASE ? AS uploaded", (str(temp_uploaded),))
-            replace_tables = [
-                "users",
-                "roles",
-                "workspaces",
-                "queue_items",
-                "group_finance",
-                "withdrawals",
-                "payout_accounts",
-                "mirrors",
-            ]
-            keep_tables = [
-                "settings",
-                "custom_operators",
-                "group_operator_prices",
-                "user_prices",
-                "treasury_invoices",
-            ]
-            for table in replace_tables:
-                try:
-                    self.conn.execute(f"INSERT OR REPLACE INTO main.{table} SELECT * FROM uploaded.{table}")
-                except Exception:
-                    logging.exception("replace merge table failed: %s", table)
-            # keep_tables are intentionally not overwritten to preserve prices and settings.
-            # If the uploaded DB has any new missing rows in those tables, schema defaults cover them.
-            try:
-                self.conn.commit()
-            except Exception:
-                pass
-            try:
-                self.conn.execute("DETACH DATABASE uploaded")
-            except Exception:
-                pass
-        finally:
-            try:
-                temp_uploaded.unlink(missing_ok=True)
-            except Exception:
-                pass
+        # IMPORTANT:
+        # Uploaded DB is treated as the source of truth.
+        # We fully replace current bot.db with the uploaded file so prices/settings/statistics
+        # stay exactly as they are inside the uploaded database.
+        shutil.move(str(temp_uploaded), self.path)
+        self.conn = sqlite3.connect(self.path)
+        self.conn.row_factory = sqlite3.Row
 
+        # Make sure schema exists for any missing tables/columns, but do not overwrite data.
         self.create_tables()
         self.seed_defaults()
         try:
@@ -388,6 +355,10 @@ class Database:
             globals().get('restore_operators_from_db_anywhere', lambda: None)()
         except Exception:
             logging.exception('post-upload operator restore failed')
+        try:
+            cleanup_database_size(18)
+        except Exception:
+            logging.exception('post-upload cleanup failed')
         return backup_path
 
     def create_tables(self):
