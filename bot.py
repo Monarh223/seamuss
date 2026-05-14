@@ -5135,6 +5135,82 @@ async def admin_settings(callback: CallbackQuery):
     await safe_callback_answer(callback)
 
 
+
+
+# required_join_hardfix
+@router.callback_query(F.data == "admin:required_join_manage")
+async def admin_required_join_manage_hardfix(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await safe_edit_or_send(
+        callback,
+        "<b>👥 Обязательная подписка</b>\n\n"
+        "Добавьте канал для обязательной подписки.",
+        reply_markup=required_join_manage_kb()
+    )
+    await safe_callback_answer(callback)
+
+
+@router.callback_query(F.data == "admin:required_join_add")
+async def admin_required_join_add_hardfix(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_required_join_item)
+    await callback.message.answer(
+        "Отправьте ID канала и ссылку через пробел.\n\n"
+        "Пример:\n"
+        "<code>-1001234567890 https://t.me/example</code>"
+    )
+    await safe_callback_answer(callback)
+
+
+@router.message(AdminStates.waiting_required_join_item)
+async def admin_required_join_item_hardfix(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    raw = (message.text or "").strip()
+    parts = raw.split(maxsplit=1)
+
+    if not parts:
+        await message.answer("❌ Неверный формат.")
+        return
+
+    try:
+        chat_id = int(parts[0])
+    except Exception:
+        await message.answer("❌ ID канала должен быть числом.")
+        return
+
+    link = parts[1].strip() if len(parts) > 1 else ""
+
+    items = required_join_entries()
+    exists = False
+
+    for item in items:
+        if int(item.get("chat_id", 0)) == chat_id:
+            item["link"] = link
+            exists = True
+            break
+
+    if not exists:
+        items.append({
+            "chat_id": chat_id,
+            "link": link,
+            "title": ""
+        })
+
+    save_required_join_entries(items)
+
+    await state.clear()
+
+    await message.answer(
+        "✅ Канал обязательной подписки добавлен.\n\n"
+        f"ID: <code>{chat_id}</code>\n"
+        f"Ссылка: {escape(link) if link else '—'}"
+    )
+
 @router.callback_query(F.data == "admin:set_withdraw_channel")
 async def admin_set_withdraw_channel(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
