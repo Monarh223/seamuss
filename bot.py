@@ -140,6 +140,11 @@ for _op_key, _prices in PERMANENT_OPERATOR_PRICES.items():
     if _op_key in PERMANENT_OPERATOR_CONFIG:
         PERMANENT_OPERATOR_CONFIG[_op_key]["price"] = float(_prices["hold"])
 PERMANENT_OPERATOR_KEYS = set(PERMANENT_OPERATOR_CONFIG.keys())
+GROUP_DEFAULT_PRICES_BY_MODE = {
+    "hold": {k: float(v["hold"]) for k, v in PERMANENT_OPERATOR_PRICES.items()},
+    "no_hold": {k: float(v["no_hold"]) for k, v in PERMANENT_OPERATOR_PRICES.items()},
+}
+
 ACTIVE_OPERATOR_KEYS = set(PERMANENT_OPERATOR_CONFIG.keys())
 OPERATOR_KEY_ALIASES = {
     "mtc": "mts", "mts_premium": "mtssalon", "mtspremium": "mtssalon", "mts_salon": "mtssalon",
@@ -251,6 +256,7 @@ class AdminStates(StatesGroup):
     waiting_operator_price = State()
     waiting_group_finance_amount = State()
     waiting_group_price_value = State()
+    waiting_group_default_price_value = State()
     waiting_role_user = State()
     waiting_role_kind = State()
     waiting_start_text = State()
@@ -350,12 +356,11 @@ class Database:
             try:
                 shutil.copyfile(current_path, backup_path)
             except Exception:
-                logging.exception("failed to create DB backup before merge")
+                logging.exception("failed to create DB backup before replace")
         try:
             self.conn.execute("ATTACH DATABASE ? AS uploaded", (str(temp_uploaded),))
             self.conn.execute("PRAGMA foreign_keys=OFF")
-            # Dynamic data comes from uploaded DB, static settings/prices remain local.
-            dynamic_tables = [
+            tables_to_copy = [
                 "users",
                 "queue_items",
                 "withdrawals",
@@ -364,24 +369,24 @@ class Database:
                 "workspaces",
                 "treasury_invoices",
                 "group_finance",
+                "settings",
+                "custom_operators",
+                "group_operator_prices",
+                "user_prices",
+                "roles",
             ]
-            for table in dynamic_tables:
+            for table in tables_to_copy:
                 try:
-                    self.conn.execute(f"DELETE FROM main.{table}")
                     main_cols = [r[1] for r in self.conn.execute(f"PRAGMA main.table_info({table})").fetchall()]
                     up_cols = [r[1] for r in self.conn.execute(f"PRAGMA uploaded.table_info({table})").fetchall()]
                     common = [c for c in main_cols if c in up_cols]
                     if not common:
                         continue
                     cols_sql = ",".join(common)
-                    self.conn.execute(
-                        f"INSERT OR IGNORE INTO main.{table} ({cols_sql}) SELECT {cols_sql} FROM uploaded.{table}"
-                    )
+                    self.conn.execute(f"DELETE FROM main.{table}")
+                    self.conn.execute(f"INSERT INTO main.{table} ({cols_sql}) SELECT {cols_sql} FROM uploaded.{table}")
                 except Exception:
-                    logging.exception("merge table failed: %s", table)
-
-            # Do NOT overwrite static tables from uploaded:
-            # settings, custom_operators, group_operator_prices, user_prices, roles
+                    logging.exception("copy table failed: %s", table)
             self.conn.commit()
         finally:
             try:
@@ -2455,6 +2460,7 @@ def render_admin_settings() -> str:
         f"👥 Обяз. группа: <code>{escape(db.get_setting('required_join_chat_id', '0'))}</code>\n"
         f"🔗 Ссылка вступления: <code>{escape(db.get_setting('required_join_link', ''))}</code>\n"
         f"🗄 Канал автобэкапа: <code>{escape(db.get_setting('backup_channel_id', '0'))}</code>\n"
+        f"🏷 Общий прайс для групп: <b>{'задан' if db.get_setting('group_default_price_hold_mts', None) is not None else 'не задан'}</b>\n"
         f"📱 Операторов в системе: <b>{len(OPERATORS)}</b>\n"
         f"🔁 Автовыгрузка БД: <b>{'Включена' if is_backup_enabled() else 'Выключена'}</b>\n"
         f"📣 Рассылка: <b>{'задана' if db.get_setting('broadcast_text', '').strip() else 'пусто'}</b>"
@@ -2485,6 +2491,23 @@ def prices_kb():
     kb.adjust(2)
     return kb.as_markup()
 
+def group_default_prices_kb():
+    kb = InlineKeyboardBuilder()
+    for mode in ("hold", "no_hold"):
+        mode_label_text = "🏷 Группы ⏳" if mode == "hold" else "🏷 Группы ⚡"
+        for key in OPERATORS:
+            cur = group_default_price_for_take(key, mode)
+            kb.add(make_operator_button(operator_key=key, callback_data=f"admin:set_group_default_price:{mode}:{key}", prefix_mark=f"{mode_label_text} • ", suffix_text=f" • {usd(cur)}"))
+    kb.button(text="↩️ Назад", callback_data="admin:settings")
+    kb.adjust(2)
+    return kb.as_markup()
+
+def render_group_default_prices() -> str:
+    lines = ["<b>🏷 Общий прайс для групп</b>", "", "Цены по умолчанию для всех групп, если для группы нет отдельного прайса."]
+    for key in OPERATORS:
+        lines.append(f"• {op_text(key)} — ⏳ {usd(group_default_price_for_take(key, 'hold'))} / ⚡ {usd(group_default_price_for_take(key, 'no_hold'))}")
+    return "\n".join(lines)
+
 def settings_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="💸 Мин. вывод", callback_data="admin:set_min_withdraw")
@@ -2497,6 +2520,7 @@ def settings_kb():
     kb.button(text="🧾 Канал логов", callback_data="admin:set_log_channel")
     kb.button(text="👥 Обяз. подписка", callback_data="admin:required_join_manage")
     kb.button(text="🗄 Канал автобэкапа", callback_data="admin:set_backup_channel")
+    kb.button(text="🏷 Общий прайс для групп", callback_data="admin:group_default_prices")
     kb.button(text="🔁 Автовыгрузка БД", callback_data="admin:toggle_backup")
     kb.button(text="📤 Скачать БД", callback_data="admin:download_db")
     kb.button(text="📥 Загрузить БД", callback_data="admin:upload_db")
@@ -3296,12 +3320,23 @@ async def send_queue_item_photo_to_chat(target_bot: Bot, chat_id: int, item, cap
             except Exception:
                 pass
 
+def group_default_price_for_take(operator_key: str, mode: str) -> float:
+    operator_key = normalize_operator_key(operator_key)
+    mode = "hold" if str(mode).lower() == "hold" else "no_hold"
+    raw = db.get_setting(f"group_default_price_{mode}_{operator_key}", None)
+    if raw is not None:
+        try:
+            return float(raw)
+        except Exception:
+            pass
+    return float(GROUP_DEFAULT_PRICES_BY_MODE.get(mode, {}).get(operator_key, DEFAULT_GROUP_PRICES.get(operator_key, get_mode_price(operator_key, mode, None))))
+
 def group_price_for_take(chat_id: int, thread_id: int | None, operator_key: str, mode: str) -> float:
     operator_key = normalize_operator_key(operator_key)
     price = db.get_group_price(chat_id, thread_id, operator_key, mode)
     if price is not None:
         return float(price)
-    return float(DEFAULT_GROUP_PRICES.get(operator_key, get_mode_price(operator_key, mode, None)))
+    return float(group_default_price_for_take(operator_key, mode))
 
 def render_group_finance(chat_id: int, thread_id: int | None) -> str:
     title_label = escape(workspace_display_title(chat_id, thread_id))
@@ -3566,11 +3601,20 @@ def enforce_permanent_operators():
         hold_price = float(PERMANENT_OPERATOR_PRICES.get(key, {}).get("hold", data["price"]))
         no_hold_price = float(PERMANENT_OPERATOR_PRICES.get(key, {}).get("no_hold", data["price"]))
         OPERATORS[key] = {"title": title, "price": hold_price, "command": command}
-        db.set_setting(f"operator_title_{key}", title)
-        db.set_setting(f"operator_command_{key}", command)
-        db.set_setting(f"price_{key}", str(hold_price))
-        db.set_setting(f"price_hold_{key}", str(hold_price))
-        db.set_setting(f"price_no_hold_{key}", str(no_hold_price))
+        if db.get_setting(f"operator_title_{key}", None) is None:
+            db.set_setting(f"operator_title_{key}", title)
+        if db.get_setting(f"operator_command_{key}", None) is None:
+            db.set_setting(f"operator_command_{key}", command)
+        if db.get_setting(f"price_{key}", None) is None:
+            db.set_setting(f"price_{key}", str(hold_price))
+        if db.get_setting(f"price_hold_{key}", None) is None:
+            db.set_setting(f"price_hold_{key}", str(hold_price))
+        if db.get_setting(f"price_no_hold_{key}", None) is None:
+            db.set_setting(f"price_no_hold_{key}", str(no_hold_price))
+        if db.get_setting(f"group_default_price_hold_{key}", None) is None:
+            db.set_setting(f"group_default_price_hold_{key}", str(hold_price))
+        if db.get_setting(f"group_default_price_no_hold_{key}", None) is None:
+            db.set_setting(f"group_default_price_no_hold_{key}", str(no_hold_price))
         if db.get_setting(f"operator_emoji_{key}", None) is None:
             emoji_id, emoji = CUSTOM_OPERATOR_EMOJI.get(key, ("", "📱"))
             db.set_setting(f"operator_emoji_id_{key}", emoji_id or "")
@@ -3601,11 +3645,20 @@ def seed_permanent_operators_to_db():
                     is_deleted=0,
                     updated_at=excluded.updated_at
             """, (key, title, hold_price, command, emoji_id or "", emoji or "📱", now_str()))
-            db.set_setting(f"operator_title_{key}", title)
-            db.set_setting(f"operator_command_{key}", command)
-            db.set_setting(f"price_{key}", str(hold_price))
-            db.set_setting(f"price_hold_{key}", str(hold_price))
-            db.set_setting(f"price_no_hold_{key}", str(no_hold_price))
+            if db.get_setting(f"operator_title_{key}", None) is None:
+                db.set_setting(f"operator_title_{key}", title)
+            if db.get_setting(f"operator_command_{key}", None) is None:
+                db.set_setting(f"operator_command_{key}", command)
+            if db.get_setting(f"price_{key}", None) is None:
+                db.set_setting(f"price_{key}", str(hold_price))
+            if db.get_setting(f"price_hold_{key}", None) is None:
+                db.set_setting(f"price_hold_{key}", str(hold_price))
+            if db.get_setting(f"price_no_hold_{key}", None) is None:
+                db.set_setting(f"price_no_hold_{key}", str(no_hold_price))
+            if db.get_setting(f"group_default_price_hold_{key}", None) is None:
+                db.set_setting(f"group_default_price_hold_{key}", str(hold_price))
+            if db.get_setting(f"group_default_price_no_hold_{key}", None) is None:
+                db.set_setting(f"group_default_price_no_hold_{key}", str(no_hold_price))
             if db.get_setting(f"operator_emoji_id_{key}", None) is None:
                 db.set_setting(f"operator_emoji_id_{key}", emoji_id or "")
             if db.get_setting(f"operator_emoji_{key}", None) is None:
@@ -3651,7 +3704,7 @@ def restore_operators_from_db_anywhere():
                 continue
             title = db.get_setting(f'operator_title_{key}', key.upper())
             command = db.get_setting(f'operator_command_{key}', f'/{key}')
-            raw_price = db.get_setting(f'price_{key}', db.get_setting(f'price_hold_{key}', db.get_setting(f'price_no_hold_{key}', '0')))
+            raw_price = db.get_setting(f'price_hold_{key}', db.get_setting(f'price_no_hold_{key}', db.get_setting(f'price_{key}', '0')))
             try:
                 price = float(raw_price or 0)
             except Exception:
@@ -5068,6 +5121,138 @@ async def admin_prices(callback: CallbackQuery):
     await safe_edit_or_send(callback, render_admin_prices(), reply_markup=prices_kb())
     await safe_callback_answer(callback)
 
+
+
+@router.callback_query(F.data == "admin:group_default_prices")
+async def admin_group_default_prices(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await safe_edit_or_send(callback, render_group_default_prices(), reply_markup=group_default_prices_kb())
+    await safe_callback_answer(callback)
+
+
+@router.callback_query(F.data.startswith("admin:set_group_default_price:"))
+async def admin_set_group_default_price(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    _, _, mode, operator_key = callback.data.split(":")
+    await state.set_state(AdminStates.waiting_group_default_price_value)
+    await state.update_data(group_default_price_mode=mode, group_default_price_key=operator_key)
+    await callback.message.answer(f"Введите общий прайс для групп: {op_text(operator_key)} • <b>{mode_label(mode)}</b>")
+    await safe_callback_answer(callback)
+
+
+@router.message(AdminStates.waiting_group_default_price_value)
+async def admin_group_default_price_value(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    try:
+        value = float((message.text or "").replace(",", ".").replace("$", "").strip())
+    except Exception:
+        await message.answer("Введите цену числом.")
+        return
+    if value <= 0:
+        await message.answer("Цена должна быть больше 0.")
+        return
+    data = await state.get_data()
+    mode = data.get("group_default_price_mode")
+    operator_key = data.get("group_default_price_key")
+    if mode not in {"hold", "no_hold"} or not operator_key:
+        await state.clear()
+        await message.answer("❌ Не удалось сохранить цену.")
+        return
+    db.set_setting(f"group_default_price_{mode}_{operator_key}", str(value))
+    await state.clear()
+    await message.answer(render_group_default_prices(), reply_markup=group_default_prices_kb())
+
+
+@router.callback_query(F.data == "admin:group_default_prices")
+async def admin_group_default_prices(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await safe_edit_or_send(callback, render_group_default_prices(), reply_markup=group_default_prices_kb())
+    await safe_callback_answer(callback)
+
+
+@router.callback_query(F.data.startswith("admin:set_group_default_price:"))
+async def admin_set_group_default_price(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    _, _, mode, operator_key = callback.data.split(":")
+    await state.set_state(AdminStates.waiting_group_default_price_value)
+    await state.update_data(group_default_price_mode=mode, group_default_price_key=operator_key)
+    await callback.message.answer(f"Введите общий прайс для групп: {op_text(operator_key)} • <b>{mode_label(mode)}</b>")
+    await safe_callback_answer(callback)
+
+
+@router.message(AdminStates.waiting_group_default_price_value)
+async def admin_group_default_price_value(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    try:
+        value = float((message.text or "").replace(",", ".").replace("$", "").strip())
+    except Exception:
+        await message.answer("Введите цену числом.")
+        return
+    if value <= 0:
+        await message.answer("Цена должна быть больше 0.")
+        return
+    data = await state.get_data()
+    mode = data.get("group_default_price_mode")
+    operator_key = data.get("group_default_price_key")
+    if mode not in {"hold", "no_hold"} or not operator_key:
+        await state.clear()
+        await message.answer("❌ Не удалось сохранить цену.")
+        return
+    db.set_setting(f"group_default_price_{mode}_{operator_key}", str(value))
+    await state.clear()
+    await message.answer(render_group_default_prices(), reply_markup=group_default_prices_kb())
+
+
+@router.callback_query(F.data == "admin:group_default_prices")
+async def admin_group_default_prices(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await safe_edit_or_send(callback, render_group_default_prices(), reply_markup=group_default_prices_kb())
+    await safe_callback_answer(callback)
+
+
+@router.callback_query(F.data.startswith("admin:set_group_default_price:"))
+async def admin_set_group_default_price(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    _, _, mode, operator_key = callback.data.split(":")
+    await state.set_state(AdminStates.waiting_group_default_price_value)
+    await state.update_data(group_default_price_mode=mode, group_default_price_key=operator_key)
+    await callback.message.answer(f"Введите общий прайс для групп: {op_text(operator_key)} • <b>{mode_label(mode)}</b>")
+    await safe_callback_answer(callback)
+
+
+@router.message(AdminStates.waiting_group_default_price_value)
+async def admin_group_default_price_value(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    try:
+        value = float((message.text or "").replace(",", ".").replace("$", "").strip())
+    except Exception:
+        await message.answer("Введите цену числом.")
+        return
+    if value <= 0:
+        await message.answer("Цена должна быть больше 0.")
+        return
+    data = await state.get_data()
+    mode = data.get("group_default_price_mode")
+    operator_key = data.get("group_default_price_key")
+    if mode not in {"hold", "no_hold"} or not operator_key:
+        await state.clear()
+        await message.answer("❌ Не удалось сохранить цену.")
+        return
+    db.set_setting(f"group_default_price_{mode}_{operator_key}", str(value))
+    await state.clear()
+    await message.answer(render_group_default_prices(), reply_markup=group_default_prices_kb())
 
 @router.callback_query(F.data == "admin:roles")
 async def admin_roles(callback: CallbackQuery):
